@@ -1,0 +1,14 @@
+{
+    "$schema": "https://raw.githubusercontent.com/phpbench/phpbench/master/phpbench.schema.json",
+    "runner.path": "Tests/Bench",
+    "runner.bootstrap": "../../../../../vendor/autoload.php",
+    "runner.iterations": [3],
+    "runner.revs": [100],
+    "runner.warmup": 1,
+    "report.generators": {
+        "default": {
+            "generator": "table",
+            "cols": ["benchmark", "subject", "revs", "its", "mean", "mode", "rstdev", "diff"]
+        }
+    }
+}
