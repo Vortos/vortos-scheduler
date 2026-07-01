@@ -192,7 +192,7 @@ final class SchedulerResolverArchTest extends TestCase
 
     public function test_extension_registers_static_schedule_registry(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertTrue(
@@ -207,7 +207,7 @@ final class SchedulerResolverArchTest extends TestCase
             $this->markTestSkipped('DBAL not available.');
         }
 
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertTrue(
@@ -218,7 +218,7 @@ final class SchedulerResolverArchTest extends TestCase
 
     public function test_extension_autoconfigures_static_schedule_definition_with_tag(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         $autoconfigured = $container->getAutoconfiguredInstanceof();
@@ -266,5 +266,18 @@ final class SchedulerResolverArchTest extends TestCase
             $violations,
             'Registry/ must be free of I/O imports: ' . implode(', ', $violations),
         );
+    }
+
+    /**
+     * SchedulerExtension::load() hard-requires kernel.project_dir/kernel.env (same
+     * convention as CacheExtension, AuthExtension, ... — see CacheExtensionEnvDefaultsTest).
+     */
+    private function newContainer(): ContainerBuilder
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('kernel.project_dir', sys_get_temp_dir() . '/missing_vortos_scheduler_config');
+        $container->setParameter('kernel.env', 'test');
+
+        return $container;
     }
 }

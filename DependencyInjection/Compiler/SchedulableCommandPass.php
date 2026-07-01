@@ -7,6 +7,7 @@ namespace Vortos\Scheduler\DependencyInjection\Compiler;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Reference;
+use Vortos\Domain\Command\CommandInterface;
 use Vortos\Scheduler\Engine\FireDispatcher;
 use Vortos\Scheduler\Registry\StaticScheduleRegistry;
 use Vortos\Scheduler\Security\Attribute\SchedulableCommand;
@@ -40,8 +41,36 @@ final class SchedulableCommandPass implements CompilerPassInterface
             return; // No allowlisted commands — validator not activated
         }
 
+        $this->assertAllowlistedCommandsAreDispatchable($allowlist);
         $this->crossCheckStaticSchedules($container, $allowlist);
         $this->registerValidator($container, $allowlist);
+    }
+
+    /**
+     * S12: the fire-queue consumer dispatches allowlisted commands through the CQRS
+     * CommandBus, which requires CommandInterface. Catching a mismatch here (deploy
+     * time) is strictly better than discovering it when a fire-queue row throws at
+     * hydration time in production.
+     *
+     * @param array<string, true> $allowlist
+     */
+    private function assertAllowlistedCommandsAreDispatchable(array $allowlist): void
+    {
+        if (!interface_exists(CommandInterface::class)) {
+            return; // vortos-domain not installed in this container's dependency set
+        }
+
+        foreach (array_keys($allowlist) as $class) {
+            if (!is_a($class, CommandInterface::class, true)) {
+                throw new \RuntimeException(sprintf(
+                    'Command "%s" carries #[SchedulableCommand] but does not implement %s. '
+                    . 'The scheduler dispatches allowlisted commands through the CQRS CommandBus, '
+                    . 'which requires every command to implement CommandInterface (idempotencyKey()).',
+                    $class,
+                    CommandInterface::class,
+                ));
+            }
+        }
     }
 
     /**

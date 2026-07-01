@@ -13,6 +13,7 @@ use Vortos\Scheduler\Fire\ScheduleRun;
 use Vortos\Scheduler\Schedule\ScheduleId;
 use Vortos\Scheduler\Store\Exception\DuplicateSlotException;
 use Vortos\Scheduler\Store\Exception\InvalidRunStateTransitionException;
+use Vortos\Scheduler\Store\PruneResult;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 
 /**
@@ -28,6 +29,8 @@ final class DbalScheduleRunStore implements ScheduleRunStoreInterface
     public function __construct(
         private readonly Connection $connection,
         private readonly string     $table = 'vortos_scheduler_runs',
+        private readonly int        $pruneBatchSize = 5000,
+        private readonly int        $pruneMaxDurationSec = 240,
     ) {}
 
     public function insertRun(ScheduleRun $run): void
@@ -151,18 +154,36 @@ final class DbalScheduleRunStore implements ScheduleRunStoreInterface
         return $row !== false ? $this->hydrate($row) : null;
     }
 
-    public function pruneOldRuns(DateTimeImmutable $before): int
+    public function pruneOldRuns(DateTimeImmutable $before, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult
     {
-        return (int) $this->connection->executeStatement(
-            "DELETE FROM {$this->table}
-             WHERE dispatched_at < ?
-               AND run_state IN (?, ?)",
-            [
-                $this->utc($before),
-                RunState::Completed->value,
-                RunState::Failed->value,
-            ],
-        );
+        if ($tenantId !== null && $excludeTenantIds !== []) {
+            throw new \InvalidArgumentException(
+                'pruneOldRuns(): $tenantId and $excludeTenantIds are mutually exclusive.',
+            );
+        }
+
+        $cutoff       = $this->utc($before);
+        $deadline     = microtime(true) + max(0, $this->pruneMaxDurationSec);
+        $batchSize    = max(1, $this->pruneBatchSize);
+        $totalDeleted = 0;
+        $truncated    = false;
+
+        while (true) {
+            [$sql, $params] = $this->buildChunkDeleteQuery($cutoff, $tenantId, $excludeTenantIds);
+            $affected        = (int) $this->connection->executeStatement($sql, $params);
+            $totalDeleted   += $affected;
+
+            if ($affected < $batchSize) {
+                break; // drained — fewer than a full batch means nothing eligible remains
+            }
+
+            if (microtime(true) >= $deadline) {
+                $truncated = true;
+                break;
+            }
+        }
+
+        return new PruneResult($totalDeleted, $truncated);
     }
 
     public function findLastDispatchTimes(array $scheduleIds, ?string $tenantId): array
@@ -233,6 +254,39 @@ final class DbalScheduleRunStore implements ScheduleRunStoreInterface
         );
 
         return $row !== false ? RunState::from((string) $row['run_state']) : null;
+    }
+
+    /**
+     * Builds one bounded chunk of the delete. `DELETE ... LIMIT` is not portable
+     * across Postgres/SQLite, so the bound is applied via a `run_id IN (subquery
+     * ORDER BY dispatched_at LIMIT N)` — identical shape on both platforms.
+     *
+     * @param list<string> $excludeTenantIds
+     * @return array{0: string, 1: list<mixed>}
+     */
+    private function buildChunkDeleteQuery(string $cutoff, ?string $tenantId, array $excludeTenantIds): array
+    {
+        $limit  = max(1, (int) $this->pruneBatchSize);
+        $where  = 'dispatched_at < ? AND run_state IN (?, ?)';
+        $params = [$cutoff, RunState::Completed->value, RunState::Failed->value];
+
+        if ($tenantId !== null) {
+            $where   .= ' AND tenant_id = ?';
+            $params[] = $tenantId;
+        } elseif ($excludeTenantIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($excludeTenantIds), '?'));
+            $where       .= " AND (tenant_id NOT IN ({$placeholders}) OR tenant_id IS NULL)";
+            array_push($params, ...$excludeTenantIds);
+        }
+
+        $sql = "DELETE FROM {$this->table} WHERE run_id IN (
+            SELECT run_id FROM {$this->table}
+            WHERE {$where}
+            ORDER BY dispatched_at ASC
+            LIMIT {$limit}
+        )";
+
+        return [$sql, $params];
     }
 
     private function utc(DateTimeImmutable $dt): string

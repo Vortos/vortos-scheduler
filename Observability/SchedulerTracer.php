@@ -65,4 +65,69 @@ final class SchedulerTracer
             $span->end();
         }
     }
+
+    /**
+     * Wrap a prune sweep (auto or manual) in a span. Returns the callable's return value.
+     * On exception: records the error on the span, marks it ERROR, and rethrows.
+     */
+    public function tracePrune(string $trigger, callable $sweep): mixed
+    {
+        if ($this->tracer === null) {
+            return $sweep();
+        }
+
+        $span = $this->tracer->startSpan('scheduler.prune', ['scheduler.prune.trigger' => $trigger]);
+
+        try {
+            $result = $sweep();
+            $span->setStatus('ok');
+
+            return $result;
+        } catch (\Throwable $e) {
+            $span->recordException($e);
+            $span->setStatus('error');
+            throw $e;
+        } finally {
+            $span->end();
+        }
+    }
+
+    /**
+     * Wrap a fire-queue consume (S12) in a span. Returns the callable's return value.
+     * On exception: records the error on the span, marks it ERROR, and rethrows.
+     */
+    public function traceConsume(
+        string $scheduleId,
+        string $slot,
+        ?string $tenantId,
+        callable $execute,
+    ): mixed {
+        if ($this->tracer === null) {
+            return $execute();
+        }
+
+        $attributes = [
+            'scheduler.schedule_id' => $scheduleId,
+            'scheduler.slot'        => $slot,
+        ];
+
+        if ($tenantId !== null) {
+            $attributes['scheduler.tenant_id'] = $tenantId;
+        }
+
+        $span = $this->tracer->startSpan('scheduler.consume', $attributes);
+
+        try {
+            $result = $execute();
+            $span->setStatus('ok');
+
+            return $result;
+        } catch (\Throwable $e) {
+            $span->recordException($e);
+            $span->setStatus('error');
+            throw $e;
+        } finally {
+            $span->end();
+        }
+    }
 }

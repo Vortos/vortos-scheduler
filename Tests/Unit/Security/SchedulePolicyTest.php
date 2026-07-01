@@ -166,6 +166,27 @@ final class SchedulePolicyTest extends TestCase
         $policy->assertCanRunNow($identity, ScheduleFactory::normal());
     }
 
+    // ── assertCanManageRetention ─────────────────────────────────────────────
+
+    public function test_allows_manage_retention_for_admin(): void
+    {
+        $policy   = new SchedulePolicy($this->engine(['ROLE_SCHEDULER_ADMIN' => ['scheduler.retention.manage']]));
+        $identity = new UserIdentity('admin-1', ['ROLE_SCHEDULER_ADMIN']);
+
+        $policy->assertCanManageRetention($identity, 'tenant-1');
+        self::assertTrue($policy->canManageRetention($identity, 'tenant-1'));
+    }
+
+    public function test_manage_retention_throws_for_non_admin(): void
+    {
+        $policy   = new SchedulePolicy($this->engine(['ROLE_SCHEDULER_USER' => ['scheduler.create.own']]));
+        $identity = new UserIdentity('user-1', ['ROLE_SCHEDULER_USER']);
+
+        self::assertFalse($policy->canManageRetention($identity, 'tenant-1'));
+        $this->expectException(ScheduleAccessDeniedException::class);
+        $policy->assertCanManageRetention($identity, 'tenant-1');
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /**

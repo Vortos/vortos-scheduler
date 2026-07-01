@@ -73,7 +73,7 @@ final class ScheduleDoctorCommandTest extends TestCase
         self::assertArrayHasKey('schema_version', $data);
         self::assertArrayHasKey('clear', $data);
         self::assertArrayHasKey('findings', $data);
-        self::assertCount(9, $data['findings']);
+        self::assertCount(11, $data['findings']);
     }
 
     public function test_doctor_exits_one_when_checks_fail(): void
@@ -91,7 +91,10 @@ final class ScheduleDoctorCommandTest extends TestCase
             'vortos_scheduler_schedules',
             'vortos_scheduler_runs',
             'vortos_scheduler_audit_log',
+            'vortos_scheduler_audit_checkpoints',
             'vortos_scheduler_static_overrides',
+            'vortos_scheduler_fire_queue',
+            'vortos_scheduler_run_retention_overrides',
         ];
         $command = new ScheduleDoctorCommand($this->makeDoctor($tables));
         $tester  = new CommandTester($command);
@@ -126,7 +129,10 @@ final class ScheduleDoctorCommandTest extends TestCase
             'vortos_scheduler_schedules',
             'vortos_scheduler_runs',
             'vortos_scheduler_audit_log',
+            'vortos_scheduler_audit_checkpoints',
             'vortos_scheduler_static_overrides',
+            'vortos_scheduler_fire_queue',
+            'vortos_scheduler_run_retention_overrides',
         ];
         $command = new ScheduleDoctorCommand($this->makeDoctor($tables));
         $tester  = new CommandTester($command);

@@ -22,6 +22,8 @@ use Vortos\Scheduler\Security\Exception\FourEyesApprovalRequiredException;
 use Vortos\Scheduler\Security\FourEyesGate;
 use Vortos\Scheduler\Security\SchedulePolicyInterface;
 use Vortos\Scheduler\Store\Exception\ScheduleNotFoundException;
+use Vortos\Scheduler\Store\RunRetentionOverride;
+use Vortos\Scheduler\Store\RunRetentionOverrideStoreInterface;
 use Vortos\Scheduler\Store\ScheduleStatusOverride;
 use Vortos\Scheduler\Store\ScheduleStatusOverrideStoreInterface;
 use Vortos\Scheduler\Store\ScheduleStoreInterface;
@@ -46,6 +48,7 @@ final class ScheduleService implements ScheduleServiceInterface
         private readonly ?FourEyesGate                         $fourEyesGate = null,
         private readonly ?SchedulerAuditProjector              $audit = null,
         private readonly ?CommandSpecValidator                  $validator = null,
+        private readonly ?RunRetentionOverrideStoreInterface    $retentionOverrideStore = null,
     ) {}
 
     /**
@@ -264,6 +267,55 @@ final class ScheduleService implements ScheduleServiceInterface
         $this->audit?->onManualFire($schedule, $actor->id(), $slot, $reason);
 
         return $result;
+    }
+
+    /**
+     * Set (or replace) a tenant's run-retention override — admin-only (no `.own`
+     * scope; see SchedulerPermissionCatalog::grants()). `$days = 0` is a deliberate
+     * "legal hold" — this tenant's runs become permanently exempt from auto-prune,
+     * distinct from "use the global default."
+     *
+     * @throws \Vortos\Scheduler\Security\Exception\ScheduleAccessDeniedException if not permitted
+     * @throws \InvalidArgumentException if $days < 0
+     * @throws \LogicException if the retention override store is not registered (DBAL unavailable)
+     */
+    public function setRunRetentionOverride(
+        string                $tenantId,
+        int                   $days,
+        UserIdentityInterface $actor,
+        ?string               $reason = null,
+    ): void {
+        $this->policy->assertCanManageRetention($actor, $tenantId);
+
+        if ($this->retentionOverrideStore === null) {
+            throw new \LogicException(
+                'RunRetentionOverrideStoreInterface is not registered — DBAL is required for retention overrides.',
+            );
+        }
+
+        $override = new RunRetentionOverride($tenantId, $days, $actor->id(), $this->clock->now());
+        $this->retentionOverrideStore->save($override);
+        $this->audit?->onRetentionOverrideSet($tenantId, $days, $actor->id(), $reason);
+    }
+
+    /**
+     * Remove a tenant's run-retention override, restoring the global default.
+     *
+     * @throws \Vortos\Scheduler\Security\Exception\ScheduleAccessDeniedException if not permitted
+     * @throws \LogicException if the retention override store is not registered (DBAL unavailable)
+     */
+    public function removeRunRetentionOverride(string $tenantId, UserIdentityInterface $actor): void
+    {
+        $this->policy->assertCanManageRetention($actor, $tenantId);
+
+        if ($this->retentionOverrideStore === null) {
+            throw new \LogicException(
+                'RunRetentionOverrideStoreInterface is not registered — DBAL is required for retention overrides.',
+            );
+        }
+
+        $this->retentionOverrideStore->remove($tenantId);
+        $this->audit?->onRetentionOverrideRemoved($tenantId, $actor->id());
     }
 
     /**

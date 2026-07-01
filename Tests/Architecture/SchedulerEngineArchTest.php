@@ -14,7 +14,6 @@ use Vortos\Scheduler\Engine\MisfireResolver;
 use Vortos\Scheduler\Engine\Outbox\DbalSchedulerEnqueuer;
 use Vortos\Scheduler\Engine\SchedulerEnqueuerPort;
 use Vortos\Scheduler\Engine\SlotCalculator;
-use Vortos\Scheduler\Fire\RunCompletionMiddleware;
 use Vortos\Scheduler\Fire\RunStamp;
 use Vortos\Scheduler\Fire\ScheduledFire;
 use Vortos\Scheduler\Testing\RecordingSchedulerEnqueuer;
@@ -30,8 +29,7 @@ use Vortos\Scheduler\Testing\RecordingSchedulerEnqueuer;
  *  3. SchedulerEnqueuerPort is an interface.
  *  4. DbalSchedulerEnqueuer implements SchedulerEnqueuerPort.
  *  5. RecordingSchedulerEnqueuer implements SchedulerEnqueuerPort.
- *  6. RunCompletionMiddleware implements MiddlewareInterface.
- *  7. FireDispatcher has exactly the right constructor parameters.
+ *  6. FireDispatcher has exactly the right constructor parameters.
  */
 final class SchedulerEngineArchTest extends TestCase
 {
@@ -120,23 +118,6 @@ final class SchedulerEngineArchTest extends TestCase
     public function test_recording_scheduler_enqueuer_implements_port(): void
     {
         self::assertInstanceOf(SchedulerEnqueuerPort::class, new RecordingSchedulerEnqueuer());
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // Consumer middleware
-    // ─────────────────────────────────────────────────────────────
-
-    public function test_run_completion_middleware_implements_middleware_interface(): void
-    {
-        self::assertTrue(
-            (new \ReflectionClass(RunCompletionMiddleware::class))
-                ->implementsInterface(\Vortos\Messaging\Middleware\MiddlewareInterface::class)
-        );
-    }
-
-    public function test_run_completion_middleware_is_final(): void
-    {
-        self::assertTrue((new \ReflectionClass(RunCompletionMiddleware::class))->isFinal());
     }
 
     // ─────────────────────────────────────────────────────────────

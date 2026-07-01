@@ -23,16 +23,22 @@ use Vortos\Scheduler\Audit\SchedulerAuditProjector;
 use Vortos\Scheduler\Audit\SchedulerAuditRepositoryInterface;
 use Vortos\Scheduler\Clock\ClockPort;
 use Vortos\Scheduler\Clock\SystemClock;
+use Vortos\Scheduler\Command\Handler\PruneSchedulerRunsHandler;
+use Vortos\Scheduler\Command\PruneSchedulerRunsCommand;
+use Vortos\Scheduler\Console\RetentionOverrideRemoveCommand;
+use Vortos\Scheduler\Console\RetentionOverrideSetCommand;
+use Vortos\Scheduler\Console\SchedulerConsumeCommand;
 use Vortos\Scheduler\Console\SchedulerRunCommand;
 use Vortos\Scheduler\DependencyInjection\Compiler\LeaseDriverPass;
 use Vortos\Scheduler\Engine\CircuitBreaker\DispatchCircuitBreaker;
+use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
 use Vortos\Scheduler\Engine\DueScan;
 use Vortos\Scheduler\Engine\FireDispatcher;
 use Vortos\Scheduler\Engine\MisfireResolver;
 use Vortos\Scheduler\Engine\Outbox\DbalSchedulerEnqueuer;
 use Vortos\Scheduler\Engine\SchedulerDaemon;
 use Vortos\Scheduler\Engine\SchedulerEnqueuerPort;
-use Vortos\Scheduler\Fire\RunCompletionMiddleware;
+use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Lease\Driver\InMemoryLeaseStore;
 use Vortos\Scheduler\Lease\Driver\PostgresAdvisoryLeaseStore;
 use Vortos\Scheduler\Lease\Driver\RedisLeaseStore;
@@ -44,14 +50,19 @@ use Vortos\Scheduler\Observability\SchedulerMetricDefinitions;
 use Vortos\Scheduler\Observability\SchedulerMetrics;
 use Vortos\Scheduler\Observability\SchedulerMetricsPort;
 use Vortos\Scheduler\Observability\SchedulerTracer;
+use Vortos\Scheduler\Store\Dbal\DbalRunRetentionOverrideStore;
 use Vortos\Scheduler\Store\Dbal\DbalScheduleRunStore;
 use Vortos\Scheduler\Store\Dbal\DbalScheduleStore;
 use Vortos\Scheduler\Store\Dbal\ScheduleSerializer;
+use Vortos\Scheduler\Store\RunRetentionOverrideStoreInterface;
 use Vortos\Scheduler\DependencyInjection\Compiler\StaticSchedulePass;
 use Vortos\Scheduler\Registry\CachingScheduleResolver;
+use Vortos\Scheduler\Registry\PruneSchedulerRunsSchedule;
 use Vortos\Scheduler\Registry\ScheduleResolver;
 use Vortos\Scheduler\Registry\StaticScheduleDefinition;
 use Vortos\Scheduler\Registry\StaticScheduleRegistry;
+use Vortos\Scheduler\Retention\FireQueuePruner;
+use Vortos\Scheduler\Retention\RunRetentionSweeper;
 use Vortos\Scheduler\Security\Approval\Dbal\DbalFourEyesApprovalStore;
 use Vortos\Scheduler\Security\FourEyesGate;
 use Vortos\Scheduler\Security\NullSchedulePolicy;
@@ -86,23 +97,57 @@ final class SchedulerExtension extends Extension
 
     public function load(array $configs, ContainerBuilder $container): void
     {
+        $config = $this->loadConfig($container);
+
+        // LeaseDriverPass runs as a separate compiler pass, after Extension::load()
+        // returns — a container parameter is how a resolved config value crosses
+        // that boundary, since the pass has no other way to see $config.
+        $container->setParameter('vortos_scheduler.lease_driver', $config['lease_driver']);
+
         $this->registerClock($container);
-        $this->registerLeaseDrivers($container);
-        $this->registerStores($container);
-        $this->registerEngine($container);
-        $this->registerResolver($container);
-        $this->registerSecurity($container);
-        $this->registerAudit($container);
-        $this->registerMetrics($container);
-        $this->registerObservability($container);
-        $this->registerDaemon($container);
+        $this->registerLeaseDrivers($container, $config);
+        $this->registerStores($container, $config);
+        $this->registerEngine($container, $config);
+        $this->registerResolver($container, $config);
+        $this->registerSecurity($container, $config);
+        $this->registerAudit($container, $config);
+        $this->registerMetrics($container, $config);
+        $this->registerObservability($container, $config);
+        $this->registerDaemon($container, $config);
         $this->registerOverrideStore($container);
+        $this->registerRetention($container, $config);
+        $this->registerConsumer($container, $config);
         $this->registerService($container);
-        $this->registerDoctor($container);
+        $this->registerDoctor($container, $config);
         $this->registerConsoleCommands($container);
     }
 
-    private function registerResolver(ContainerBuilder $container): void
+    /**
+     * Loads config/scheduler.php then config/{env}/scheduler.php (env overrides base) —
+     * same convention as CacheExtension/AuthExtension/CqrsExtension/... throughout this
+     * framework: kernel.project_dir and kernel.env are hard requirements, not optional.
+     */
+    private function loadConfig(ContainerBuilder $container): array
+    {
+        $projectDir = (string) $container->getParameter('kernel.project_dir');
+        $env        = (string) $container->getParameter('kernel.env');
+
+        $config = new VortosSchedulerConfig();
+
+        $base = $projectDir . '/config/scheduler.php';
+        if (file_exists($base)) {
+            (require $base)($config);
+        }
+
+        $envFile = $projectDir . '/config/' . $env . '/scheduler.php';
+        if (file_exists($envFile)) {
+            (require $envFile)($config);
+        }
+
+        return $this->processConfiguration(new Configuration(), [$config->toArray()]);
+    }
+
+    private function registerResolver(ContainerBuilder $container, array $config): void
     {
         // Autoconfigure: any StaticScheduleDefinition impl automatically gets the static_schedule tag.
         $container->registerForAutoconfiguration(StaticScheduleDefinition::class)
@@ -129,11 +174,10 @@ final class SchedulerExtension extends Extension
 
         // E4: in-process TTL cache for the resolver — reduces store round-trips in CLI/admin paths.
         // The daemon still uses the raw ScheduleResolver directly for zero-overhead hot path.
-        $resolverCacheTtl = \max(0, (int) ($_ENV['SCHEDULER_RESOLVER_CACHE_TTL_SEC'] ?? 5));
         $container->register(CachingScheduleResolver::class, CachingScheduleResolver::class)
             ->setArgument('$inner',  new Reference(ScheduleResolver::class))
             ->setArgument('$clock',  new Reference(ClockPort::class))
-            ->setArgument('$ttlSec', $resolverCacheTtl)
+            ->setArgument('$ttlSec', $config['resolver_cache_ttl_sec'])
             ->setPublic(false);
     }
 
@@ -146,7 +190,7 @@ final class SchedulerExtension extends Extension
         $container->setAlias(ClockInterface::class, SystemClock::class);
     }
 
-    private function registerStores(ContainerBuilder $container): void
+    private function registerStores(ContainerBuilder $container, array $config): void
     {
         if (!class_exists(Connection::class)) {
             return;
@@ -168,22 +212,29 @@ final class SchedulerExtension extends Extension
         $container->register(DbalScheduleRunStore::class, DbalScheduleRunStore::class)
             ->setArgument('$connection', new Reference(Connection::class))
             ->setArgument('$table', $prefix . 'scheduler_runs')
+            ->setArgument('$pruneBatchSize', $config['prune_batch_size'])
+            ->setArgument('$pruneMaxDurationSec', $config['prune_max_duration_sec'])
+            ->setPublic(false);
+
+        $container->register(DbalRunRetentionOverrideStore::class, DbalRunRetentionOverrideStore::class)
+            ->setArgument('$connection', new Reference(Connection::class))
+            ->setArgument('$table', $prefix . 'scheduler_run_retention_overrides')
             ->setPublic(false);
 
         $container->setAlias(ScheduleStoreInterface::class, DbalScheduleStore::class);
         $container->setAlias(ScheduleRunStoreInterface::class, DbalScheduleRunStore::class);
+        $container->setAlias(RunRetentionOverrideStoreInterface::class, DbalRunRetentionOverrideStore::class);
     }
 
-    private function registerEngine(ContainerBuilder $container): void
+    private function registerEngine(ContainerBuilder $container, array $config): void
     {
         // Pure engine components — no infrastructure dependencies
         $container->register(MisfireResolver::class, MisfireResolver::class)
             ->setPublic(false);
 
-        $maxCatchupAge = (int) ($_ENV['SCHEDULER_MAX_CATCHUP_AGE_SECONDS'] ?? 86400);
         $container->register(DueScan::class, DueScan::class)
             ->setArgument('$misfireResolver', new Reference(MisfireResolver::class))
-            ->setArgument('$maxCatchupAgeSec', $maxCatchupAge)
+            ->setArgument('$maxCatchupAgeSec', $config['max_catchup_age_sec'])
             ->setPublic(false);
 
         if (!class_exists(Connection::class)) {
@@ -201,37 +252,26 @@ final class SchedulerExtension extends Extension
 
         $container->setAlias(SchedulerEnqueuerPort::class, DbalSchedulerEnqueuer::class);
 
-        $assumedDoneTtl = (int) ($_ENV['SCHEDULER_ASSUMED_DONE_TTL_SECONDS'] ?? 3600);
         $container->register(FireDispatcher::class, FireDispatcher::class)
             ->setArgument('$runStore',         new Reference(ScheduleRunStoreInterface::class))
             ->setArgument('$enqueuer',         new Reference(SchedulerEnqueuerPort::class))
             ->setArgument('$connection',       new Reference(Connection::class))
             ->setArgument('$clock',            new Reference(ClockInterface::class))
-            ->setArgument('$assumedDoneTtlSec', $assumedDoneTtl)
+            ->setArgument('$assumedDoneTtlSec', $config['assumed_done_ttl_sec'])
             ->setPublic(false);
 
         // E3: circuit-breaker wraps FireDispatcher; opens after N consecutive backend failures.
-        $cbThreshold      = \max(1, (int) ($_ENV['SCHEDULER_CB_FAILURE_THRESHOLD'] ?? 5));
-        $cbRecoveryWindow = \max(1, (int) ($_ENV['SCHEDULER_CB_RECOVERY_WINDOW_SEC'] ?? 30));
         $container->register(DispatchCircuitBreaker::class, DispatchCircuitBreaker::class)
             ->setArgument('$inner',             new Reference(FireDispatcher::class))
             ->setArgument('$clock',             new Reference(ClockPort::class))
-            ->setArgument('$failureThreshold',  $cbThreshold)
-            ->setArgument('$recoveryWindowSec', $cbRecoveryWindow)
+            ->setArgument('$failureThreshold',  $config['circuit_breaker_failure_threshold'])
+            ->setArgument('$recoveryWindowSec', $config['circuit_breaker_recovery_window_sec'])
             ->setPublic(false);
 
         $container->setAlias(FireDispatcherPort::class, DispatchCircuitBreaker::class);
-
-        // RunCompletionMiddleware: registered as consumer middleware (vortos.middleware, priority 50).
-        // Transitions the fire-ledger run state to Completed inside TransactionalMiddleware's TX.
-        $container->register(RunCompletionMiddleware::class, RunCompletionMiddleware::class)
-            ->setArgument('$runStore', new Reference(ScheduleRunStoreInterface::class))
-            ->setArgument('$clock',    new Reference(ClockInterface::class))
-            ->addTag('vortos.middleware', ['priority' => 50])
-            ->setPublic(false);
     }
 
-    private function registerSecurity(ContainerBuilder $container): void
+    private function registerSecurity(ContainerBuilder $container, array $config): void
     {
         $prefix = $container->hasParameter('vortos.db.framework_table_prefix')
             ? (string) $container->getParameter('vortos.db.framework_table_prefix')
@@ -247,11 +287,10 @@ final class SchedulerExtension extends Extension
 
         // 4-eyes gate
         if ($container->hasDefinition(DbalFourEyesApprovalStore::class)) {
-            $approvalTtl = (int) ($_ENV['SCHEDULER_APPROVAL_TTL_SECONDS'] ?? 86400);
             $container->register(FourEyesGate::class, FourEyesGate::class)
                 ->setArgument('$store',          new Reference(DbalFourEyesApprovalStore::class))
                 ->setArgument('$clock',          new Reference(ClockInterface::class))
-                ->setArgument('$approvalTtlSec', $approvalTtl)
+                ->setArgument('$approvalTtlSec', $config['approval_ttl_sec'])
                 ->setPublic(false);
         }
 
@@ -282,7 +321,7 @@ final class SchedulerExtension extends Extension
         }
     }
 
-    private function registerAudit(ContainerBuilder $container): void
+    private function registerAudit(ContainerBuilder $container, array $config): void
     {
         if (!class_exists(Connection::class)) {
             return;
@@ -299,7 +338,7 @@ final class SchedulerExtension extends Extension
 
         $container->setAlias(SchedulerAuditRepositoryInterface::class, DbalSchedulerAuditRepository::class);
 
-        $hmacKey = (string) ($_ENV['SCHEDULER_AUDIT_HMAC_KEY'] ?? '');
+        $hmacKey = $config['audit_hmac_key'];
         $env     = (string) ($_ENV['APP_ENV'] ?? 'production');
 
         // E5: per-epoch HMAC checkpoints for fast O(n/epochSize) chain verification.
@@ -318,11 +357,10 @@ final class SchedulerExtension extends Extension
         );
 
         if ($hmacKey !== '') {
-            $epochSize = \max(1, (int) ($_ENV['SCHEDULER_AUDIT_EPOCH_SIZE'] ?? 1000));
             $container->register(SchedulerAuditCheckpointProjector::class, SchedulerAuditCheckpointProjector::class)
                 ->setArgument('$repository', new Reference(SchedulerAuditCheckpointRepositoryInterface::class))
                 ->setArgument('$hmacKey',    $hmacKey)
-                ->setArgument('$epochSize',  $epochSize)
+                ->setArgument('$epochSize',  $config['audit_epoch_size'])
                 ->setPublic(false);
 
             $container->register(SchedulerAuditProjector::class, SchedulerAuditProjector::class)
@@ -335,7 +373,7 @@ final class SchedulerExtension extends Extension
         }
     }
 
-    private function registerMetrics(ContainerBuilder $container): void
+    private function registerMetrics(ContainerBuilder $container, array $config): void
     {
         // Register metric definitions so MetricDefinitionsCompilerPass picks them up.
         if (interface_exists(MetricDefinitionProviderInterface::class)) {
@@ -354,17 +392,16 @@ final class SchedulerExtension extends Extension
             ->setPublic(false);
 
         // E1: cardinality-guarded wrapper keeps Prometheus label space bounded.
-        $maxCardinality = \max(1, (int) ($_ENV['SCHEDULER_METRICS_MAX_CARDINALITY'] ?? 200));
         $container->register(CardinalityGuardedSchedulerMetrics::class, CardinalityGuardedSchedulerMetrics::class)
             ->setArgument('$inner', new Reference(SchedulerMetrics::class))
             ->setArgument('$metrics', $metricsRef)
-            ->setArgument('$maxDistinctSchedules', $maxCardinality)
+            ->setArgument('$maxDistinctSchedules', $config['metrics_max_cardinality'])
             ->setPublic(false);
 
         $container->setAlias(SchedulerMetricsPort::class, CardinalityGuardedSchedulerMetrics::class);
     }
 
-    private function registerObservability(ContainerBuilder $container): void
+    private function registerObservability(ContainerBuilder $container, array $config): void
     {
         // SchedulerTracer — wraps framework TracingInterface (null = no-op)
         $tracerRef = interface_exists(TracingInterface::class) && $container->has(TracingInterface::class)
@@ -384,27 +421,19 @@ final class SchedulerExtension extends Extension
         // DeadManDetector — requires AlertDispatcherInterface from vortos-alerts
         $alertsClass = 'Vortos\Alerts\AlertDispatcherInterface';
         if (class_exists($alertsClass) && $container->has($alertsClass) && $container->hasDefinition(DbalScheduleRunStore::class)) {
-            $toleranceSec = \max(1, (int) ($_ENV['SCHEDULER_DEADMAN_TOLERANCE_SEC'] ?? 300));
-            $env          = (string) ($_ENV['APP_ENV'] ?? 'production');
-
             $container->register(DeadManDetector::class, DeadManDetector::class)
                 ->setArgument('$runStore',        new Reference(ScheduleRunStoreInterface::class))
                 ->setArgument('$dispatcher',      new Reference($alertsClass))
                 ->setArgument('$clock',           new Reference(ClockPort::class))
-                ->setArgument('$env',             $env)
-                ->setArgument('$defaultToleranceSec', $toleranceSec)
+                ->setArgument('$env',             (string) ($_ENV['APP_ENV'] ?? 'production'))
+                ->setArgument('$defaultToleranceSec', $config['dead_man_tolerance_sec'])
                 ->setArgument('$logger',          new Reference(LoggerInterface::class))
                 ->setPublic(false);
         }
     }
 
-    private function registerDaemon(ContainerBuilder $container): void
+    private function registerDaemon(ContainerBuilder $container, array $config): void
     {
-        $shardCount     = \max(1, (int) ($_ENV['SCHEDULER_SHARD_COUNT'] ?? 1));
-        $leaseTtl       = \max(5, (int) ($_ENV['SCHEDULER_LEASE_TTL_SEC'] ?? 30));
-        $maxIdle        = \max(1, (int) ($_ENV['SCHEDULER_MAX_IDLE_SEC'] ?? 60));
-        $tenantMaxFires = \max(0, (int) ($_ENV['SCHEDULER_TENANT_MAX_CONCURRENT_FIRES'] ?? 0));
-
         if (!$container->hasDefinition(FireDispatcher::class)) {
             return; // DBAL not available — daemon requires store + dispatcher
         }
@@ -421,10 +450,10 @@ final class SchedulerExtension extends Extension
             ->setArgument('$fireDispatcher',          new Reference(FireDispatcher::class))
             ->setArgument('$clock',                   new Reference(ClockPort::class))
             ->setArgument('$logger',                  new Reference(LoggerInterface::class))
-            ->setArgument('$shardCount',              $shardCount)
-            ->setArgument('$leaseTtlSec',             $leaseTtl)
-            ->setArgument('$maxIdleSec',              $maxIdle)
-            ->setArgument('$tenantMaxConcurrentFires', $tenantMaxFires)
+            ->setArgument('$shardCount',              $config['shard_count'])
+            ->setArgument('$leaseTtlSec',             $config['lease_ttl_sec'])
+            ->setArgument('$maxIdleSec',              $config['max_idle_sec'])
+            ->setArgument('$tenantMaxConcurrentFires', $config['tenant_max_concurrent_fires'])
             ->setArgument('$metrics', new Reference(SchedulerMetricsPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$audit',   new Reference(SchedulerAuditProjector::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$deadMan', new Reference(DeadManDetector::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
@@ -452,7 +481,7 @@ final class SchedulerExtension extends Extension
         }
     }
 
-    private function registerLeaseDrivers(ContainerBuilder $container): void
+    private function registerLeaseDrivers(ContainerBuilder $container, array $config): void
     {
         $container->register(InMemoryLeaseStore::class, InMemoryLeaseStore::class)
             ->setArgument('$clock', new Reference(ClockPort::class))
@@ -479,11 +508,9 @@ final class SchedulerExtension extends Extension
         }
 
         if (extension_loaded('redis')) {
-            $redisDsn = (string) ($_ENV['VORTOS_CACHE_DSN'] ?? 'redis://redis:6379');
-
             $container->register('vortos_scheduler.redis', \Redis::class)
                 ->setFactory([RedisConnectionFactory::class, 'fromDsn'])
-                ->setArgument(0, $redisDsn)
+                ->setArgument(0, $config['redis_dsn'])
                 ->setPublic(false);
 
             $container->register(RedisLeaseStore::class, RedisLeaseStore::class)
@@ -511,6 +538,140 @@ final class SchedulerExtension extends Extension
         $container->setAlias(ScheduleStatusOverrideStoreInterface::class, DbalScheduleStatusOverrideStore::class);
     }
 
+    /**
+     * Auto-prune (retention) wiring. Registers RunRetentionSweeper unconditionally
+     * (used by both the automatic schedule below and the manual scheduler:prune
+     * CLI's default mode) and conditionally registers PruneSchedulerRunsSchedule +
+     * its CQRS handler — but only when the resolved retention is non-zero, so a
+     * globally-disabled install never registers a schedule that fires and no-ops.
+     */
+    private function registerRetention(ContainerBuilder $container, array $config): void
+    {
+        if (!class_exists(Connection::class) || !$container->hasDefinition(FireDispatcher::class)) {
+            return; // DBAL/engine not available
+        }
+
+        $prefix = $container->hasParameter('vortos.db.framework_table_prefix')
+            ? (string) $container->getParameter('vortos.db.framework_table_prefix')
+            : 'vortos_';
+
+        // Terminal fire-queue rows accumulate forever otherwise (S12 marks them
+        // dispatched/failed instead of deleting). Pruned as a side-step of the
+        // daily run sweep — a no-op when fire_queue_retention_days is 0.
+        if ($config['fire_queue_retention_days'] > 0) {
+            $container->register(FireQueuePruner::class, FireQueuePruner::class)
+                ->setArgument('$connection', new Reference(Connection::class))
+                ->setArgument('$clock', new Reference(ClockPort::class))
+                ->setArgument('$retentionDays', $config['fire_queue_retention_days'])
+                ->setArgument('$table', $prefix . 'scheduler_fire_queue')
+                ->setArgument('$batchSize', $config['prune_batch_size'])
+                ->setArgument('$maxDurationSec', $config['prune_max_duration_sec'])
+                ->setArgument('$logger', new Reference(LoggerInterface::class))
+                ->setArgument('$metrics', new Reference(SchedulerMetricsPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+                ->setPublic(false);
+        }
+
+        $container->register(RunRetentionSweeper::class, RunRetentionSweeper::class)
+            ->setArgument('$runStore', new Reference(ScheduleRunStoreInterface::class))
+            ->setArgument('$overrideStore', new Reference(RunRetentionOverrideStoreInterface::class))
+            ->setArgument('$clock', new Reference(ClockPort::class))
+            ->setArgument('$tracer', new Reference(SchedulerTracer::class))
+            ->setArgument('$globalRetentionDays', $config['run_retention_days'])
+            ->setArgument('$audit', new Reference(SchedulerAuditProjector::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setArgument('$metrics', new Reference(SchedulerMetricsPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setArgument('$fireQueuePruner', new Reference(FireQueuePruner::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setPublic(false);
+
+        if ($config['run_retention_days'] <= 0) {
+            return; // Disabled — no schedule registered, no daily no-op fire.
+        }
+
+        $container->register(PruneSchedulerRunsSchedule::class, PruneSchedulerRunsSchedule::class)
+            ->addTag(StaticSchedulePass::TAG)
+            ->setPublic(false);
+
+        // PruneSchedulerRunsCommand is never fetched via the container (CommandHydrator
+        // instantiates it by reflection, not $container->get()) — but it must still be
+        // registered as a definition so SchedulableCommandPass::buildAllowlist()'s
+        // #[SchedulableCommand] attribute scan (which only inspects already-registered
+        // definitions, not arbitrary classes) discovers it. Without this, any app that
+        // also registers at least one other #[SchedulableCommand] class would make the
+        // allowlist non-empty and crossCheckStaticSchedules() would reject
+        // PruneSchedulerRunsSchedule as referencing an unlisted command.
+        $container->register(PruneSchedulerRunsCommand::class, PruneSchedulerRunsCommand::class)
+            ->setPublic(false);
+
+        // Checking interface_exists() alone is not enough: in a monorepo, Cqrs classes
+        // may be autoloadable even when CqrsExtension was never loaded into THIS
+        // container (e.g. a minimal test container) — hasAlias() confirms the service
+        // is actually registered here, matching the existing $policyEngineClass /
+        // $alertsClass gates elsewhere in this file (class_exists AND hasDefinition).
+        $commandBusInterface = 'Vortos\Cqrs\Command\CommandBusInterface';
+
+        if (interface_exists($commandBusInterface) && $container->hasAlias($commandBusInterface)) {
+            $container->register(PruneSchedulerRunsHandler::class, PruneSchedulerRunsHandler::class)
+                ->setArgument('$sweeper', new Reference(RunRetentionSweeper::class))
+                ->addTag('vortos.command_handler')
+                ->setPublic(true);
+        }
+    }
+
+    /**
+     * S12: fire-queue consumer. Without this, scheduled commands are recorded as
+     * "dispatched" in the ledger but never actually execute — see
+     * SCHEDULER_AUTO_PRUNE_IMPL_PLAN.md "Prerequisite 2". Gated on the CQRS
+     * CommandBus being installed; when it isn't, SchedulerDoctor's C11 reports why.
+     */
+    private function registerConsumer(ContainerBuilder $container, array $config): void
+    {
+        $commandBusInterface = 'Vortos\Cqrs\Command\CommandBusInterface';
+
+        if (!class_exists(Connection::class)
+            || !interface_exists($commandBusInterface)
+            || !$container->hasAlias($commandBusInterface)) {
+            return;
+        }
+
+        $prefix = $container->hasParameter('vortos.db.framework_table_prefix')
+            ? (string) $container->getParameter('vortos.db.framework_table_prefix')
+            : 'vortos_';
+
+        $container->register(CommandHydrator::class, CommandHydrator::class)
+            ->setPublic(false);
+
+        $container->register(FireQueueConsumer::class, FireQueueConsumer::class)
+            ->setArgument('$connection', new Reference(Connection::class))
+            ->setArgument('$runStore', new Reference(ScheduleRunStoreInterface::class))
+            ->setArgument('$commandBus', new Reference($commandBusInterface))
+            ->setArgument('$hydrator', new Reference(CommandHydrator::class))
+            ->setArgument('$clock', new Reference(ClockInterface::class))
+            ->setArgument('$tracer', new Reference(SchedulerTracer::class))
+            ->setArgument('$metrics', new Reference(SchedulerMetricsPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setArgument('$logger', new Reference(LoggerInterface::class))
+            ->setArgument('$table', $prefix . 'scheduler_fire_queue')
+            ->setPublic(false);
+
+        $container->register(SchedulerConsumeCommand::class, SchedulerConsumeCommand::class)
+            ->setArgument('$consumer', new Reference(FireQueueConsumer::class))
+            ->setArgument('$defaultBatchSize', $config['consume_batch_size'])
+            ->setArgument('$defaultPollIntervalSec', $config['consume_poll_interval_sec'])
+            ->addTag('console.command')
+            ->setPublic(false);
+
+        if (\class_exists(\Vortos\Docker\Worker\WorkerProcessDefinition::class)) {
+            $container->register('vortos_scheduler.worker.consumer', \Vortos\Docker\Worker\WorkerProcessDefinition::class)
+                ->setArguments([
+                    'scheduler-consumer',
+                    'php /var/www/html/bin/console scheduler:consume --loop',
+                    'Vortos Scheduler: fire-queue consumer (drains scheduled commands into the CQRS bus).',
+                    true,  // autostart
+                    true,  // autorestart
+                ])
+                ->addTag('vortos.worker')
+                ->setPublic(false);
+        }
+    }
+
     private function registerService(ContainerBuilder $container): void
     {
         if (!$container->hasDefinition(ScheduleResolver::class)) {
@@ -522,6 +683,11 @@ final class SchedulerExtension extends Extension
             return;
         }
 
+        // Public: this is the package's app-facing facade. Every console command and every
+        // downstream driver (FireDispatcher, CommandSpecValidator, ScheduleResolver, ...) hangs
+        // off this constructor. If it stays private, RemoveUnusedDefinitionsPass prunes the whole
+        // dispatch chain in any container that doesn't also wire Symfony's AddConsoleCommandPass —
+        // which real apps always do, but a minimal test/embedding container may not.
         $container->register(ScheduleService::class, ScheduleService::class)
             ->setArgument('$staticRegistry', new Reference(StaticScheduleRegistry::class))
             ->setArgument('$dynamicStore', new Reference(ScheduleStoreInterface::class))
@@ -531,18 +697,17 @@ final class SchedulerExtension extends Extension
             ->setArgument('$fireDispatcher', new Reference(FireDispatcherPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$fourEyesGate', new Reference(FourEyesGate::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$audit', new Reference(SchedulerAuditProjector::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
-            ->setPublic(false);
+            ->setArgument('$retentionOverrideStore', new Reference(RunRetentionOverrideStoreInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setPublic(true);
     }
 
-    private function registerDoctor(ContainerBuilder $container): void
+    private function registerDoctor(ContainerBuilder $container, array $config): void
     {
         if (!$container->hasDefinition(ScheduleResolver::class)) {
             return;
         }
 
-        $maxCatchupAge = (int) ($_ENV['SCHEDULER_MAX_CATCHUP_AGE_SECONDS'] ?? 86400);
-        $shardCount    = max(1, (int) ($_ENV['SCHEDULER_SHARD_COUNT'] ?? 1));
-        $prefix        = $container->hasParameter('vortos.db.framework_table_prefix')
+        $prefix = $container->hasParameter('vortos.db.framework_table_prefix')
             ? (string) $container->getParameter('vortos.db.framework_table_prefix')
             : 'vortos_';
 
@@ -559,8 +724,14 @@ final class SchedulerExtension extends Extension
             ->setArgument('$validator', new Reference(\Vortos\Scheduler\Security\CommandSpecValidator::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$approvalStore', new Reference(\Vortos\Scheduler\Security\Approval\FourEyesApprovalStoreInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$tablePrefix', $prefix)
-            ->setArgument('$shardCount', $shardCount)
-            ->setArgument('$maxCatchupAgeSec', $maxCatchupAge)
+            ->setArgument('$shardCount', $config['shard_count'])
+            ->setArgument('$maxCatchupAgeSec', $config['max_catchup_age_sec'])
+            ->setArgument('$runRetentionDays', $config['run_retention_days'])
+            ->setArgument('$retentionOverrideStore', new Reference(RunRetentionOverrideStoreInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            // Reflects whether registerConsumer() actually wired the consumer in THIS
+            // container, not just whether Cqrs classes happen to be autoloadable.
+            ->setArgument('$fireQueueConsumerInstalled', $container->hasDefinition(FireQueueConsumer::class))
+            ->setArgument('$consumeStallThresholdSec', $config['consume_stall_threshold_sec'])
             ->setPublic(false);
 
         // D: deploy:doctor gate — only registered when vortos-deploy is installed.
@@ -597,6 +768,18 @@ final class SchedulerExtension extends Extension
 
             $container->register(SchedulePruneCommand::class, SchedulePruneCommand::class)
                 ->setArgument('$runStore', new Reference(ScheduleRunStoreInterface::class))
+                ->setArgument('$sweeper', new Reference(RunRetentionSweeper::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+                ->setArgument('$audit', new Reference(SchedulerAuditProjector::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+                ->addTag('console.command')
+                ->setPublic(false);
+
+            $container->register(RetentionOverrideSetCommand::class, RetentionOverrideSetCommand::class)
+                ->setArgument('$service', new Reference(ScheduleService::class))
+                ->addTag('console.command')
+                ->setPublic(false);
+
+            $container->register(RetentionOverrideRemoveCommand::class, RetentionOverrideRemoveCommand::class)
+                ->setArgument('$service', new Reference(ScheduleService::class))
                 ->addTag('console.command')
                 ->setPublic(false);
         }

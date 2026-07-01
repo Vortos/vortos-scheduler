@@ -24,7 +24,8 @@ use Vortos\Metrics\Definition\MetricDefinitionProviderInterface;
  */
 final class SchedulerMetricDefinitions implements MetricDefinitionProviderInterface
 {
-    private const LAG_BUCKETS_MS = [0, 100, 250, 500, 1_000, 5_000, 15_000, 30_000, 60_000, 300_000];
+    private const LAG_BUCKETS_MS       = [0, 100, 250, 500, 1_000, 5_000, 15_000, 30_000, 60_000, 300_000];
+    private const PRUNE_DURATION_BUCKETS_SEC = [0.1, 0.5, 1, 5, 15, 30, 60, 120, 240];
 
     public function definitions(): array
     {
@@ -69,6 +70,27 @@ final class SchedulerMetricDefinitions implements MetricDefinitionProviderInterf
                 'vortos_scheduler_audit_failures_total',
                 'Total audit append failures (non-fatal; counted for visibility).',
                 ['event_type'],
+            ),
+            MetricDefinition::counter(
+                'vortos_scheduler_consume_results_total',
+                'Total fire-queue rows executed through the CQRS CommandBus (S12), labelled by result.',
+                ['result', 'schedule_id', 'tenant_id'],
+            ),
+            MetricDefinition::counter(
+                'vortos_scheduler_runs_pruned_total',
+                'Total fire-ledger rows deleted by pruneOldRuns(), auto or manual.',
+                ['tenant_id'],
+            ),
+            MetricDefinition::counter(
+                'vortos_scheduler_fire_queue_pruned_total',
+                'Total terminal (dispatched/failed) fire-queue rows deleted by FireQueuePruner.',
+                [],
+            ),
+            MetricDefinition::histogram(
+                'vortos_scheduler_prune_duration_seconds',
+                'Wall-clock duration of one full prune sweep, labelled by trigger (auto|manual).',
+                ['trigger'],
+                self::PRUNE_DURATION_BUCKETS_SEC,
             ),
         ];
     }

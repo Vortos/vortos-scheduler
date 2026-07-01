@@ -291,9 +291,10 @@ abstract class ScheduleRunStoreConformanceTestCase extends TestCase
         $run = $this->makeRun(ScheduleId::generate(), 'prune-none', 'ta');
         $this->store->insertRun($run);
 
-        $deleted = $this->store->pruneOldRuns(new DateTimeImmutable('1970-01-01T00:00:00Z'));
+        $result = $this->store->pruneOldRuns(new DateTimeImmutable('1970-01-01T00:00:00Z'));
 
-        self::assertSame(0, $deleted);
+        self::assertSame(0, $result->deletedCount);
+        self::assertFalse($result->truncated);
     }
 
     final public function test_prune_terminal_run_older_than_cutoff(): void
@@ -303,9 +304,9 @@ abstract class ScheduleRunStoreConformanceTestCase extends TestCase
         $this->store->insertRun($run);
         $this->store->transitionRunState($run->runId, RunState::Completed, $past);
 
-        $deleted = $this->store->pruneOldRuns(new DateTimeImmutable('2021-01-01T00:00:00Z'));
+        $result = $this->store->pruneOldRuns(new DateTimeImmutable('2021-01-01T00:00:00Z'));
 
-        self::assertGreaterThanOrEqual(1, $deleted);
+        self::assertGreaterThanOrEqual(1, $result->deletedCount);
     }
 
     final public function test_prune_does_not_delete_dispatched_runs(): void
@@ -315,15 +316,62 @@ abstract class ScheduleRunStoreConformanceTestCase extends TestCase
         $this->store->insertRun($run);
         // intentionally NOT transitioning — stays dispatched
 
-        $deleted = $this->store->pruneOldRuns(new DateTimeImmutable('2021-01-01T00:00:00Z'));
+        $result = $this->store->pruneOldRuns(new DateTimeImmutable('2021-01-01T00:00:00Z'));
 
-        self::assertSame(0, $deleted);
+        self::assertSame(0, $result->deletedCount);
 
         // Confirm it's still there
         self::assertSame(
             RunState::Dispatched,
             $this->store->findRunState($run->scheduleId, $run->slot, 'ta'),
         );
+    }
+
+    final public function test_prune_scoped_to_tenant_id_only_deletes_that_tenant(): void
+    {
+        $past = new DateTimeImmutable('2020-01-01T00:00:00Z');
+
+        $runA = $this->makeRun(ScheduleId::generate(), 'prune-tenant-a', 'tenant-a', $past);
+        $runB = $this->makeRun(ScheduleId::generate(), 'prune-tenant-b', 'tenant-b', $past);
+        $this->store->insertRun($runA);
+        $this->store->insertRun($runB);
+        $this->store->transitionRunState($runA->runId, RunState::Completed, $past);
+        $this->store->transitionRunState($runB->runId, RunState::Completed, $past);
+
+        $result = $this->store->pruneOldRuns(new DateTimeImmutable('2021-01-01T00:00:00Z'), 'tenant-a');
+
+        self::assertSame(1, $result->deletedCount);
+        self::assertNull($this->store->findRunBySlot($runA->scheduleId, 'prune-tenant-a', 'tenant-a'));
+        self::assertNotNull($this->store->findRunBySlot($runB->scheduleId, 'prune-tenant-b', 'tenant-b'));
+    }
+
+    final public function test_prune_with_exclude_tenant_ids_skips_excluded_tenants(): void
+    {
+        $past = new DateTimeImmutable('2020-01-01T00:00:00Z');
+
+        $runA = $this->makeRun(ScheduleId::generate(), 'prune-excl-a', 'tenant-a', $past);
+        $runB = $this->makeRun(ScheduleId::generate(), 'prune-excl-b', 'tenant-b', $past);
+        $this->store->insertRun($runA);
+        $this->store->insertRun($runB);
+        $this->store->transitionRunState($runA->runId, RunState::Completed, $past);
+        $this->store->transitionRunState($runB->runId, RunState::Completed, $past);
+
+        $result = $this->store->pruneOldRuns(
+            new DateTimeImmutable('2021-01-01T00:00:00Z'),
+            null,
+            ['tenant-a'],
+        );
+
+        self::assertSame(1, $result->deletedCount);
+        self::assertNotNull($this->store->findRunBySlot($runA->scheduleId, 'prune-excl-a', 'tenant-a'));
+        self::assertNull($this->store->findRunBySlot($runB->scheduleId, 'prune-excl-b', 'tenant-b'));
+    }
+
+    final public function test_prune_rejects_both_tenant_id_and_exclude_list(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->store->pruneOldRuns(new DateTimeImmutable('2021-01-01T00:00:00Z'), 'tenant-a', ['tenant-b']);
     }
 
     // ─────────────────────────────────────────────────────────────

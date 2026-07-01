@@ -187,6 +187,91 @@ final class SchedulerAuditProjectorTest extends TestCase
         self::assertSame('original-actor', $entry->data['original_actor_id']);
     }
 
+    // ── Run retention / auto-prune ───────────────────────────────────────────
+
+    public function test_on_runs_pruned_records_deleted_count_and_cutoff(): void
+    {
+        $cutoff = new DateTimeImmutable('2026-06-01T00:00:00+00:00');
+        $this->projector->onRunsPruned('system', 'tenant-1', 42, $cutoff, false);
+
+        $entry = $this->lastEntry();
+        self::assertSame(SchedulerAuditEvent::RunsPruned->value, $entry->eventType);
+        self::assertSame('system', $entry->actorId);
+        self::assertSame('tenant-1', $entry->tenantId);
+        self::assertSame(42, $entry->data['deleted_count']);
+        self::assertFalse($entry->data['truncated']);
+        self::assertTrue($entry->data['resolved']);
+    }
+
+    public function test_on_runs_pruned_manual_bypass_marks_unresolved(): void
+    {
+        $this->projector->onRunsPruned('operator-1', null, 5, new DateTimeImmutable(), false, resolved: false);
+
+        self::assertFalse($this->lastEntry()->data['resolved']);
+    }
+
+    public function test_on_runs_pruned_never_throws_on_repository_failure(): void
+    {
+        $throwing = new class implements SchedulerAuditRepositoryInterface {
+            public function appendNext(string $chainKey, callable $builder): SchedulerAuditEntry
+            {
+                throw new \RuntimeException('DB is down');
+            }
+
+            public function findByChainKey(string $chainKey, int $limit = 1000): array { return []; }
+            public function findBySchedule(string $scheduleId, ?string $tenantId = null, int $limit = 500): array { return []; }
+            public function findByTenant(?string $tenantId, ?\DateTimeImmutable $from = null, ?\DateTimeImmutable $to = null, int $limit = 1000): array { return []; }
+            public function stream(?string $chainKey = null, ?\DateTimeImmutable $from = null, ?\DateTimeImmutable $to = null): \Generator { return; yield; }
+        };
+
+        $projector = new SchedulerAuditProjector($throwing, self::HMAC_KEY, 'testing');
+        $projector->onRunsPruned('system', null, 1, new DateTimeImmutable(), false);
+
+        $this->addToAssertionCount(1);
+    }
+
+    public function test_on_retention_override_set_records_days_and_reason(): void
+    {
+        $this->projector->onRetentionOverrideSet('tenant-1', 90, 'compliance-officer', 'contractual retention');
+
+        $entry = $this->lastEntry();
+        self::assertSame(SchedulerAuditEvent::RetentionOverrideSet->value, $entry->eventType);
+        self::assertSame('compliance-officer', $entry->actorId);
+        self::assertSame('tenant-1', $entry->tenantId);
+        self::assertSame(90, $entry->data['retention_days']);
+        self::assertSame('contractual retention', $entry->data['reason']);
+    }
+
+    public function test_on_retention_override_set_propagates_repository_exception(): void
+    {
+        $throwing = new class implements SchedulerAuditRepositoryInterface {
+            public function appendNext(string $chainKey, callable $builder): SchedulerAuditEntry
+            {
+                throw new \RuntimeException('DB is down');
+            }
+
+            public function findByChainKey(string $chainKey, int $limit = 1000): array { return []; }
+            public function findBySchedule(string $scheduleId, ?string $tenantId = null, int $limit = 500): array { return []; }
+            public function findByTenant(?string $tenantId, ?\DateTimeImmutable $from = null, ?\DateTimeImmutable $to = null, int $limit = 1000): array { return []; }
+            public function stream(?string $chainKey = null, ?\DateTimeImmutable $from = null, ?\DateTimeImmutable $to = null): \Generator { return; yield; }
+        };
+
+        $projector = new SchedulerAuditProjector($throwing, self::HMAC_KEY, 'testing');
+
+        $this->expectException(\RuntimeException::class);
+        $projector->onRetentionOverrideSet('tenant-1', 0, 'admin', null);
+    }
+
+    public function test_on_retention_override_removed(): void
+    {
+        $this->projector->onRetentionOverrideRemoved('tenant-1', 'admin');
+
+        $entry = $this->lastEntry();
+        self::assertSame(SchedulerAuditEvent::RetentionOverrideRemoved->value, $entry->eventType);
+        self::assertSame('admin', $entry->actorId);
+        self::assertSame('tenant-1', $entry->tenantId);
+    }
+
     // ── Chain key resolution ─────────────────────────────────────────────────
 
     public function test_chain_key_uses_tenant_id_when_set(): void

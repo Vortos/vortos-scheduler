@@ -6,7 +6,10 @@ namespace Vortos\Scheduler\Tests\Integration;
 
 use DateTimeImmutable;
 use DateTimeZone;
+use Doctrine\DBAL\Connection;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Vortos\Scheduler\DependencyInjection\Compiler\StaticSchedulePass;
@@ -201,6 +204,17 @@ final class StaticScheduleIntegrationTest extends TestCase
     private function buildContainer(array $staticClasses): ContainerBuilder
     {
         $container = new ContainerBuilder();
+
+        // SchedulerExtension::load() hard-requires these (same convention as
+        // CacheExtension, AuthExtension, ... — see CacheExtensionEnvDefaultsTest).
+        $container->setParameter('kernel.project_dir', sys_get_temp_dir() . '/missing_vortos_scheduler_config');
+        $container->setParameter('kernel.env', 'test');
+
+        // ScheduleService (the package facade) is public and its dispatch chain now
+        // survives compilation — that chain constructor-injects Connection, so a
+        // definition must exist even though these tests never instantiate it.
+        $container->register(Connection::class, Connection::class)->setPublic(false);
+        $container->register(LoggerInterface::class, NullLogger::class)->setPublic(false);
 
         (new SchedulerExtension())->load([], $container);
 

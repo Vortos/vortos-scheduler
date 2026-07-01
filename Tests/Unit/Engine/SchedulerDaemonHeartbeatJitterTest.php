@@ -26,6 +26,7 @@ use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStore;
 use Vortos\Scheduler\Registry\StaticScheduleRegistry;
 use Vortos\Scheduler\Registry\ScheduleResolver;
+use Vortos\Scheduler\Store\PruneResult;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 
 /**
@@ -184,6 +185,6 @@ final class InMemoryScheduleRunStore implements ScheduleRunStoreInterface
     public function findRunState(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\RunState { return null; }
     public function findRunBySlot(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\ScheduleRun { return null; }
     public function transitionRunState(string $runId, \Vortos\Scheduler\Fire\RunState $newState, \DateTimeImmutable $at): void {}
-    public function pruneOldRuns(\DateTimeImmutable $before): int { return 0; }
+    public function pruneOldRuns(\DateTimeImmutable $before, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult { return new PruneResult(0, false); }
     public function findLastDispatchTimes(array $scheduleIds, ?string $tenantId): array { return []; }
 }

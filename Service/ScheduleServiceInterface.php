@@ -46,6 +46,15 @@ interface ScheduleServiceInterface
         ?string               $reason = null,
     ): FireDispatchResult;
 
+    public function setRunRetentionOverride(
+        string                $tenantId,
+        int                   $days,
+        UserIdentityInterface $actor,
+        ?string               $reason = null,
+    ): void;
+
+    public function removeRunRetentionOverride(string $tenantId, UserIdentityInterface $actor): void;
+
     public function requestApproval(
         ScheduleId            $id,
         ?string               $tenantId,

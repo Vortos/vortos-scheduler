@@ -85,6 +85,10 @@ final class SchedulerDoctorTest extends TestCase
         \Vortos\Scheduler\Security\Approval\FourEyesApprovalStoreInterface $approvalStore = null,
         int $shardCount = 1,
         int $maxCatchupAgeSec = 86400,
+        int $runRetentionDays = 0,
+        \Vortos\Scheduler\Store\RunRetentionOverrideStoreInterface $retentionOverrideStore = null,
+        bool $fireQueueConsumerInstalled = false,
+        int $consumeStallThresholdSec = 120,
     ): SchedulerDoctor {
         $reg      = $registry ?? new StaticScheduleRegistry([]);
         $overrides = new InMemoryScheduleStatusOverrideStore();
@@ -92,17 +96,45 @@ final class SchedulerDoctorTest extends TestCase
         $conn      = $conn ?? $this->makeSqliteConnection();
 
         return new SchedulerDoctor(
-            resolver:         $resolver,
-            dynamicStore:     $this->dynamicStore,
-            leasePort:        $this->leaseStore,
-            connection:       $conn,
-            clock:            $this->clock,
-            validator:        $validator,
-            approvalStore:    $approvalStore,
-            tablePrefix:      self::TABLE_PREFIX,
-            shardCount:       $shardCount,
-            maxCatchupAgeSec: $maxCatchupAgeSec,
+            resolver:                    $resolver,
+            dynamicStore:                $this->dynamicStore,
+            leasePort:                   $this->leaseStore,
+            connection:                  $conn,
+            clock:                       $this->clock,
+            validator:                   $validator,
+            approvalStore:               $approvalStore,
+            tablePrefix:                 self::TABLE_PREFIX,
+            shardCount:                  $shardCount,
+            maxCatchupAgeSec:            $maxCatchupAgeSec,
+            runRetentionDays:            $runRetentionDays,
+            retentionOverrideStore:     $retentionOverrideStore,
+            fireQueueConsumerInstalled: $fireQueueConsumerInstalled,
+            consumeStallThresholdSec:   $consumeStallThresholdSec,
         );
+    }
+
+    private function makeRunsAndQueueTables(\Doctrine\DBAL\Connection $conn): void
+    {
+        $conn->executeStatement('
+            CREATE TABLE vortos_scheduler_runs (
+                run_id CHAR(64) NOT NULL PRIMARY KEY,
+                schedule_id VARCHAR(36) NOT NULL,
+                tenant_id VARCHAR(255) NULL,
+                slot TEXT NOT NULL,
+                scheduled_for DATETIME NOT NULL,
+                dispatched_at DATETIME NOT NULL,
+                completed_at DATETIME NULL,
+                run_state VARCHAR(20) NOT NULL DEFAULT "dispatched",
+                attempt SMALLINT NOT NULL DEFAULT 1
+            )
+        ');
+        $conn->executeStatement('
+            CREATE TABLE vortos_scheduler_fire_queue (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                status VARCHAR(20) NOT NULL DEFAULT "pending",
+                created_at DATETIME NOT NULL
+            )
+        ');
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -251,7 +283,10 @@ final class SchedulerDoctorTest extends TestCase
             self::TABLE_PREFIX . 'scheduler_schedules',
             self::TABLE_PREFIX . 'scheduler_runs',
             self::TABLE_PREFIX . 'scheduler_audit_log',
+            self::TABLE_PREFIX . 'scheduler_audit_checkpoints',
             self::TABLE_PREFIX . 'scheduler_static_overrides',
+            self::TABLE_PREFIX . 'scheduler_fire_queue',
+            self::TABLE_PREFIX . 'scheduler_run_retention_overrides',
         ];
         $conn = $this->makeSqliteConnection($tables);
         $report = $this->makeDoctor(conn: $conn)->run();
@@ -426,17 +461,17 @@ final class SchedulerDoctorTest extends TestCase
     // full report structure
     // ══════════════════════════════════════════════════════════════════════════
 
-    public function test_report_has_exactly_nine_findings(): void
+    public function test_report_has_exactly_eleven_findings(): void
     {
         $report = $this->makeDoctor()->run();
-        self::assertCount(9, $report->findings);
+        self::assertCount(11, $report->findings);
     }
 
-    public function test_report_finding_ids_are_c1_through_c9(): void
+    public function test_report_finding_ids_are_c1_through_c11(): void
     {
         $report = $this->makeDoctor()->run();
         $ids = array_map(fn($f) => $f->checkId, $report->findings);
-        foreach (['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9'] as $expected) {
+        foreach (['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11'] as $expected) {
             self::assertContains($expected, $ids);
         }
     }
@@ -445,12 +480,147 @@ final class SchedulerDoctorTest extends TestCase
     {
         // With no schedules and an in-memory lease store:
         // C1=Pass, C2=Pass, C3=Skip(no validator), C4=Pass, C5=Fail(no tables),
-        // C6=Skip(no approval store), C7=Pass, C8=Pass, C9=Pass
+        // C6=Skip(no approval store), C7=Pass, C8=Pass, C9=Pass,
+        // C10=Pass(runRetentionDays defaults to 0/disabled), C11=Skip(consumer not installed)
         $report = $this->makeDoctor()->run();
         $fails = array_filter($report->findings, fn($f) => $f->isFailure());
         // Only C5 (migrations) should fail in this setup
         self::assertCount(1, $fails);
         self::assertSame('C5', current($fails)->checkId);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // C10 — Auto-prune config + liveness
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function test_c10_passes_when_retention_disabled(): void
+    {
+        $report = $this->makeDoctor(runRetentionDays: 0)->run();
+        $c10 = $this->findCheck($report->findings, 'C10');
+        self::assertSame(SchedulerDoctorStatus::Pass, $c10->status);
+        self::assertStringContainsString('disabled', $c10->summary);
+    }
+
+    public function test_c10_skips_when_never_fired(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $report = $this->makeDoctor(conn: $conn, runRetentionDays: 30)->run();
+        $c10 = $this->findCheck($report->findings, 'C10');
+        self::assertSame(SchedulerDoctorStatus::Skip, $c10->status);
+    }
+
+    public function test_c10_fails_when_stale(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $scheduleId = \Vortos\Scheduler\Registry\PruneSchedulerRunsSchedule::SCHEDULE_ID;
+        $stale      = $this->clock->now()->modify('-72 hours')->format('Y-m-d H:i:s');
+
+        $conn->insert('vortos_scheduler_runs', [
+            'run_id' => str_repeat('a', 64), 'schedule_id' => $scheduleId, 'tenant_id' => null,
+            'slot' => 's', 'scheduled_for' => $stale, 'dispatched_at' => $stale,
+            'completed_at' => $stale, 'run_state' => 'completed', 'attempt' => 1,
+        ]);
+
+        $report = $this->makeDoctor(conn: $conn, runRetentionDays: 30)->run();
+        $c10 = $this->findCheck($report->findings, 'C10');
+        self::assertSame(SchedulerDoctorStatus::Fail, $c10->status);
+    }
+
+    public function test_c10_passes_when_recently_completed(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $scheduleId = \Vortos\Scheduler\Registry\PruneSchedulerRunsSchedule::SCHEDULE_ID;
+        $recent     = $this->clock->now()->modify('-2 hours')->format('Y-m-d H:i:s');
+
+        $conn->insert('vortos_scheduler_runs', [
+            'run_id' => str_repeat('b', 64), 'schedule_id' => $scheduleId, 'tenant_id' => null,
+            'slot' => 's', 'scheduled_for' => $recent, 'dispatched_at' => $recent,
+            'completed_at' => $recent, 'run_state' => 'completed', 'attempt' => 1,
+        ]);
+
+        $report = $this->makeDoctor(conn: $conn, runRetentionDays: 30)->run();
+        $c10 = $this->findCheck($report->findings, 'C10');
+        self::assertSame(SchedulerDoctorStatus::Pass, $c10->status);
+    }
+
+    public function test_c10_reports_tenant_overrides(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $retentionStore = new \Vortos\Scheduler\Testing\InMemoryRunRetentionOverrideStore();
+        $retentionStore->save(new \Vortos\Scheduler\Store\RunRetentionOverride('tenant-a', 90, 'admin', new DateTimeImmutable()));
+        $retentionStore->save(new \Vortos\Scheduler\Store\RunRetentionOverride('tenant-hold', 0, 'admin', new DateTimeImmutable()));
+
+        $recent = $this->clock->now()->modify('-2 hours')->format('Y-m-d H:i:s');
+        $conn->insert('vortos_scheduler_runs', [
+            'run_id' => str_repeat('c', 64), 'schedule_id' => \Vortos\Scheduler\Registry\PruneSchedulerRunsSchedule::SCHEDULE_ID,
+            'tenant_id' => null, 'slot' => 's', 'scheduled_for' => $recent, 'dispatched_at' => $recent,
+            'completed_at' => $recent, 'run_state' => 'completed', 'attempt' => 1,
+        ]);
+
+        $report = $this->makeDoctor(conn: $conn, runRetentionDays: 30, retentionOverrideStore: $retentionStore)->run();
+        $c10 = $this->findCheck($report->findings, 'C10');
+        self::assertStringContainsString('tenant-a', $c10->detail);
+        self::assertStringContainsString('[legal hold]', $c10->detail);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // C11 — Fire-queue consumer liveness (S12)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function test_c11_skips_when_consumer_not_installed(): void
+    {
+        $report = $this->makeDoctor(fireQueueConsumerInstalled: false)->run();
+        $c11 = $this->findCheck($report->findings, 'C11');
+        self::assertSame(SchedulerDoctorStatus::Skip, $c11->status);
+    }
+
+    public function test_c11_passes_when_queue_empty(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $report = $this->makeDoctor(conn: $conn, fireQueueConsumerInstalled: true)->run();
+        $c11 = $this->findCheck($report->findings, 'C11');
+        self::assertSame(SchedulerDoctorStatus::Pass, $c11->status);
+    }
+
+    public function test_c11_passes_when_backlog_is_fresh(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $conn->insert('vortos_scheduler_fire_queue', [
+            'id' => 'row-1', 'status' => 'pending',
+            'created_at' => $this->clock->now()->modify('-5 seconds')->format('Y-m-d H:i:s'),
+        ]);
+
+        $report = $this->makeDoctor(conn: $conn, fireQueueConsumerInstalled: true, consumeStallThresholdSec: 120)->run();
+        $c11 = $this->findCheck($report->findings, 'C11');
+        self::assertSame(SchedulerDoctorStatus::Pass, $c11->status);
+    }
+
+    public function test_c11_fails_when_backlog_is_stale(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $conn->insert('vortos_scheduler_fire_queue', [
+            'id' => 'row-1', 'status' => 'pending',
+            'created_at' => $this->clock->now()->modify('-1 hour')->format('Y-m-d H:i:s'),
+        ]);
+
+        $report = $this->makeDoctor(conn: $conn, fireQueueConsumerInstalled: true, consumeStallThresholdSec: 120)->run();
+        $c11 = $this->findCheck($report->findings, 'C11');
+        self::assertSame(SchedulerDoctorStatus::Fail, $c11->status);
+        self::assertStringContainsString('scheduler:consume', $c11->remediation);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

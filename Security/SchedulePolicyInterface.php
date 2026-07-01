@@ -42,6 +42,17 @@ interface SchedulePolicyInterface
     /** @throws ScheduleAccessDeniedException */
     public function assertCanRunNow(UserIdentityInterface $identity, Schedule $schedule): void;
 
+    /**
+     * Retention policy is tenant-wide config, not scoped to one schedule — hence no
+     * Schedule parameter, unlike every other assertCanX() above. Admin-only: no
+     * `.own` scope exists for this permission (see SchedulerPermissionCatalog).
+     *
+     * @throws ScheduleAccessDeniedException
+     */
+    public function assertCanManageRetention(UserIdentityInterface $identity, ?string $tenantId): void;
+
+    public function canManageRetention(UserIdentityInterface $identity, ?string $tenantId): bool;
+
     public function canCreate(UserIdentityInterface $identity, Schedule $schedule): bool;
 
     public function canUpdate(UserIdentityInterface $identity, Schedule $schedule): bool;

@@ -26,6 +26,7 @@ use Vortos\Scheduler\Store\ScheduleStatusOverride;
 use Vortos\Scheduler\Testing\FakeFireDispatcherPort;
 use Vortos\Scheduler\Testing\FakeSchedulePolicy;
 use Vortos\Scheduler\Testing\FakeUserIdentity;
+use Vortos\Scheduler\Testing\InMemoryRunRetentionOverrideStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStore;
 use Vortos\Scheduler\Tests\Unit\Service\Support\FixedStaticScheduleDefinition;
@@ -390,5 +391,97 @@ final class ScheduleServiceTest extends TestCase
 
         $this->makeService()->runNow($schedule->id, 'tenant-1', $this->actor);
         $this->addToAssertionCount(1);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // run retention overrides
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function test_set_run_retention_override_saves_to_store(): void
+    {
+        $retentionStore = new InMemoryRunRetentionOverrideStore();
+        $service        = $this->makeServiceWithRetentionStore($retentionStore);
+
+        $service->setRunRetentionOverride('tenant-1', 90, $this->actor, 'contractual retention');
+
+        $found = $retentionStore->find('tenant-1');
+        self::assertNotNull($found);
+        self::assertSame(90, $found->retentionDays);
+        self::assertSame('operator-1', $found->actorId);
+    }
+
+    public function test_set_run_retention_override_zero_days_is_legal_hold(): void
+    {
+        $retentionStore = new InMemoryRunRetentionOverrideStore();
+        $service        = $this->makeServiceWithRetentionStore($retentionStore);
+
+        $service->setRunRetentionOverride('tenant-hold', 0, $this->actor);
+
+        self::assertTrue($retentionStore->find('tenant-hold')?->isExempt());
+    }
+
+    public function test_set_run_retention_override_rejects_negative_days(): void
+    {
+        $service = $this->makeServiceWithRetentionStore(new InMemoryRunRetentionOverrideStore());
+
+        $this->expectException(\InvalidArgumentException::class);
+        $service->setRunRetentionOverride('tenant-1', -1, $this->actor);
+    }
+
+    public function test_set_run_retention_override_throws_on_rbac_denial(): void
+    {
+        $this->policy->deny();
+        $service = $this->makeServiceWithRetentionStore(new InMemoryRunRetentionOverrideStore());
+
+        $this->expectException(ScheduleAccessDeniedException::class);
+        $service->setRunRetentionOverride('tenant-1', 30, $this->actor);
+    }
+
+    public function test_set_run_retention_override_throws_without_store_registered(): void
+    {
+        $this->expectException(\LogicException::class);
+        $this->makeService()->setRunRetentionOverride('tenant-1', 30, $this->actor);
+    }
+
+    public function test_remove_run_retention_override_deletes_from_store(): void
+    {
+        $retentionStore = new InMemoryRunRetentionOverrideStore();
+        $service        = $this->makeServiceWithRetentionStore($retentionStore);
+        $service->setRunRetentionOverride('tenant-1', 90, $this->actor);
+
+        $service->removeRunRetentionOverride('tenant-1', $this->actor);
+
+        self::assertNull($retentionStore->find('tenant-1'));
+    }
+
+    public function test_remove_run_retention_override_throws_on_rbac_denial(): void
+    {
+        $this->policy->deny();
+        $service = $this->makeServiceWithRetentionStore(new InMemoryRunRetentionOverrideStore());
+
+        $this->expectException(ScheduleAccessDeniedException::class);
+        $service->removeRunRetentionOverride('tenant-1', $this->actor);
+    }
+
+    public function test_set_run_retention_override_without_audit_does_not_throw(): void
+    {
+        $service = $this->makeServiceWithRetentionStore(new InMemoryRunRetentionOverrideStore());
+
+        // No audit projector wired — must not throw
+        $service->setRunRetentionOverride('tenant-1', 30, $this->actor);
+        $this->addToAssertionCount(1);
+    }
+
+    private function makeServiceWithRetentionStore(InMemoryRunRetentionOverrideStore $retentionStore): ScheduleService
+    {
+        return new ScheduleService(
+            staticRegistry:          new StaticScheduleRegistry([]),
+            dynamicStore:             $this->dynamicStore,
+            overrideStore:            $this->overrideStore,
+            policy:                   $this->policy,
+            clock:                    $this->clock,
+            fireDispatcher:           $this->dispatcher,
+            retentionOverrideStore:  $retentionStore,
+        );
     }
 }

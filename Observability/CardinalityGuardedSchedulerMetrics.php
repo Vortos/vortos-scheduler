@@ -84,6 +84,26 @@ final class CardinalityGuardedSchedulerMetrics implements SchedulerMetricsPort
         $this->inner->recordAuditFailure($eventType);
     }
 
+    public function recordConsumeResult(bool $success, string $scheduleId, ?string $tenantId): void
+    {
+        $this->inner->recordConsumeResult($success, $this->sanitize($scheduleId), $tenantId);
+    }
+
+    public function recordRunsPruned(int $count, ?string $tenantId): void
+    {
+        $this->inner->recordRunsPruned($count, $tenantId);
+    }
+
+    public function recordFireQueuePruned(int $count): void
+    {
+        $this->inner->recordFireQueuePruned($count);
+    }
+
+    public function recordPruneDuration(float $seconds, string $trigger): void
+    {
+        $this->inner->recordPruneDuration($seconds, $trigger);
+    }
+
     private function sanitize(string $scheduleId): string
     {
         if (isset($this->seenScheduleIds[$scheduleId])) {

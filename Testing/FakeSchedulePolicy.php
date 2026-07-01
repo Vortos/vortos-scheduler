@@ -78,4 +78,16 @@ final class FakeSchedulePolicy implements SchedulePolicyInterface
     {
         return !$this->deny;
     }
+
+    public function assertCanManageRetention(UserIdentityInterface $identity, ?string $tenantId): void
+    {
+        if ($this->deny) {
+            throw new ScheduleAccessDeniedException('retention.manage', $identity->id());
+        }
+    }
+
+    public function canManageRetention(UserIdentityInterface $identity, ?string $tenantId): bool
+    {
+        return !$this->deny;
+    }
 }

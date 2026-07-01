@@ -25,7 +25,14 @@ final class LeaseDriverPass implements CompilerPassInterface
 
     public function process(ContainerBuilder $container): void
     {
-        $driverKey   = (string) ($_ENV['VORTOS_SCHEDULER_LEASE_DRIVER'] ?? 'sql');
+        // Set by SchedulerExtension::load() from VortosSchedulerConfig — this pass runs
+        // as a separate compile step afterward, so a container parameter is how the
+        // resolved config value crosses that boundary. Falls back to the raw env var
+        // for any container that adds this pass without loading SchedulerExtension first.
+        $driverKey = $container->hasParameter('vortos_scheduler.lease_driver')
+            ? (string) $container->getParameter('vortos_scheduler.lease_driver')
+            : (string) ($_ENV['VORTOS_SCHEDULER_LEASE_DRIVER'] ?? 'sql');
+
         $driverClass = self::DRIVER_MAP[$driverKey] ?? null;
 
         if ($driverClass === null) {

@@ -12,6 +12,7 @@ use Vortos\Scheduler\Engine\FireDispatcher;
 use Vortos\Scheduler\Security\Attribute\SchedulableCommand;
 use Vortos\Scheduler\Security\CommandSpecValidator;
 use Vortos\Scheduler\Tests\Unit\Security\Support\StubAllowlistedCommand;
+use Vortos\Scheduler\Tests\Unit\Security\Support\StubAllowlistedCommandWithoutInterface;
 use Vortos\Scheduler\Tests\Unit\Security\Support\StubNonAllowlistedCommand;
 
 final class SchedulableCommandPassTest extends TestCase
@@ -92,6 +93,18 @@ final class SchedulableCommandPassTest extends TestCase
         // Should not throw — FireDispatcher simply wasn't registered
         self::assertTrue($container->hasDefinition(CommandSpecValidator::class));
         self::assertFalse($container->hasDefinition(FireDispatcher::class));
+    }
+
+    // ── S12: CommandInterface compile-time assertion ───────────────────────
+
+    public function test_rejects_allowlisted_command_not_implementing_command_interface(): void
+    {
+        $container = $this->containerWithCommand(StubAllowlistedCommandWithoutInterface::class);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessageMatches('/does not implement.*CommandInterface/');
+
+        (new SchedulableCommandPass())->process($container);
     }
 
     // ── TAG constant ─────────────────────────────────────────────────────

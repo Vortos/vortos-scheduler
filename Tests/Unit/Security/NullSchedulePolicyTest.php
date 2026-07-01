@@ -70,6 +70,15 @@ final class NullSchedulePolicyTest extends TestCase
         $this->addToAssertionCount(1);
     }
 
+    public function test_allows_manage_retention_and_logs_warning(): void
+    {
+        $identity = new UserIdentity('user-1', []);
+        $this->logger->expects(self::once())->method('warning');
+
+        $this->policy->assertCanManageRetention($identity, 'tenant-1');
+        self::assertTrue($this->policy->canManageRetention($identity, 'tenant-1'));
+    }
+
     public function test_log_message_includes_action_and_identity(): void
     {
         $identity = new UserIdentity('the-user-id', []);

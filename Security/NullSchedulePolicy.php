@@ -44,6 +44,16 @@ final class NullSchedulePolicy implements SchedulePolicyInterface
         $this->warn('run-now', $identity);
     }
 
+    public function assertCanManageRetention(UserIdentityInterface $identity, ?string $tenantId): void
+    {
+        $this->warn('retention.manage', $identity);
+    }
+
+    public function canManageRetention(UserIdentityInterface $identity, ?string $tenantId): bool
+    {
+        return true;
+    }
+
     public function canCreate(UserIdentityInterface $identity, Schedule $schedule): bool
     {
         return true;

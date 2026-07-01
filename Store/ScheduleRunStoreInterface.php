@@ -68,8 +68,8 @@ interface ScheduleRunStoreInterface
     /**
      * Transition a run's state (dispatched → completed|failed).
      *
-     * Called by RunCompletionMiddleware (S4) inside the CommandBus's own transaction,
-     * so the state flip is atomic with the business handler commit.
+     * Called by FireQueueConsumer (S12) after the CQRS CommandBus::dispatch() call
+     * returns (success) or throws (failure).
      *
      * State machine is enforced: terminal states (completed, failed) cannot be
      * transitioned again. Non-existent runId throws \RuntimeException (programming error,
@@ -99,12 +99,30 @@ interface ScheduleRunStoreInterface
 
     /**
      * Delete completed/failed runs older than $before. Dispatched (in-flight) runs
-     * are never pruned. Returns the number of rows deleted.
+     * are never pruned.
      *
-     * Defines the seam for the scheduler:prune CLI command (S9).
+     * Batched internally (bounded rows-per-statement and a wall-clock budget) — a
+     * large first-run backlog on an upgraded install is pruned across several calls,
+     * not one unbounded DELETE. PruneResult::$truncated tells the caller whether the
+     * budget was exhausted with more rows potentially still eligible; this is a
+     * normal, expected outcome, not an error.
+     *
+     * Tenant scope — exactly one of the following two shapes, never both:
+     *   - $tenantId = 'abc', $excludeTenantIds = []      → prune only tenant 'abc'.
+     *   - $tenantId = null,  $excludeTenantIds = [...]   → prune every tenant EXCEPT
+     *     the listed ones (and tenant_id IS NULL rows). Empty $excludeTenantIds with
+     *     $tenantId = null reproduces the original unscoped, all-tenants behavior.
+     * Passing both a non-null $tenantId and a non-empty $excludeTenantIds is invalid.
+     *
+     * Used by RunRetentionSweeper (auto-prune) to prune each tenant at its own
+     * resolved retention in one sweep, and by the manual scheduler:prune CLI.
      * Safe to call concurrently — the WHERE clause restricts to terminal states only.
+     *
+     * @param list<string> $excludeTenantIds
+     *
+     * @throws \InvalidArgumentException if both $tenantId and $excludeTenantIds are set
      */
-    public function pruneOldRuns(DateTimeImmutable $before): int;
+    public function pruneOldRuns(DateTimeImmutable $before, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult;
 
     /**
      * Bulk-fetch the most recent dispatched_at per schedule. Single query for N schedules.

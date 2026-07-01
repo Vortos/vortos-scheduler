@@ -164,6 +164,70 @@ final class SchedulerMetrics implements SchedulerMetricsPort
         }
     }
 
+    public function recordConsumeResult(bool $success, string $scheduleId, ?string $tenantId): void
+    {
+        if ($this->metrics === null) {
+            return;
+        }
+
+        try {
+            $this->metrics->counter(
+                'vortos_scheduler_consume_results_total',
+                [
+                    'result'      => $success ? 'success' : 'failure',
+                    'schedule_id' => $scheduleId,
+                    'tenant_id'   => $tenantId ?? 'system',
+                ],
+            )->increment();
+        } catch (\Throwable) {
+        }
+    }
+
+    public function recordRunsPruned(int $count, ?string $tenantId): void
+    {
+        if ($this->metrics === null || $count === 0) {
+            return;
+        }
+
+        try {
+            $this->metrics->counter(
+                'vortos_scheduler_runs_pruned_total',
+                ['tenant_id' => $tenantId ?? 'system'],
+            )->increment((float) $count);
+        } catch (\Throwable) {
+        }
+    }
+
+    public function recordFireQueuePruned(int $count): void
+    {
+        if ($this->metrics === null || $count === 0) {
+            return;
+        }
+
+        try {
+            $this->metrics->counter(
+                'vortos_scheduler_fire_queue_pruned_total',
+                [],
+            )->increment((float) $count);
+        } catch (\Throwable) {
+        }
+    }
+
+    public function recordPruneDuration(float $seconds, string $trigger): void
+    {
+        if ($this->metrics === null) {
+            return;
+        }
+
+        try {
+            $this->metrics->histogram(
+                'vortos_scheduler_prune_duration_seconds',
+                ['trigger' => $trigger],
+            )->observe(max(0.0, $seconds));
+        } catch (\Throwable) {
+        }
+    }
+
     private function fireResultLabel(FireDispatchResult $result): string
     {
         return match ($result) {

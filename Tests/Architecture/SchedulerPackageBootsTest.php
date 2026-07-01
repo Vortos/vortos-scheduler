@@ -34,7 +34,7 @@ final class SchedulerPackageBootsTest extends TestCase
 
     public function test_extension_loads_without_error(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         $this->addToAssertionCount(1);
@@ -42,7 +42,7 @@ final class SchedulerPackageBootsTest extends TestCase
 
     public function test_clock_port_alias_is_registered(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertTrue(
@@ -53,7 +53,7 @@ final class SchedulerPackageBootsTest extends TestCase
 
     public function test_psr20_clock_interface_alias_is_registered(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertTrue(
@@ -65,7 +65,7 @@ final class SchedulerPackageBootsTest extends TestCase
     public function test_package_build_does_not_throw(): void
     {
         $pkg       = new SchedulerPackage();
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         $pkg->build($container);
 
         $this->addToAssertionCount(1);
@@ -73,7 +73,7 @@ final class SchedulerPackageBootsTest extends TestCase
 
     public function test_in_memory_lease_store_is_registered_by_extension(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertTrue(
@@ -84,12 +84,25 @@ final class SchedulerPackageBootsTest extends TestCase
 
     public function test_lease_port_alias_not_set_before_compiler_pass_runs(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertFalse(
             $container->hasAlias(\Vortos\Scheduler\Lease\LeasePort::class),
             'LeasePort alias must not be set by the extension alone — only the LeaseDriverPass sets it.',
         );
+    }
+
+    /**
+     * SchedulerExtension::load() hard-requires kernel.project_dir/kernel.env (same
+     * convention as CacheExtension, AuthExtension, ... — see CacheExtensionEnvDefaultsTest).
+     */
+    private function newContainer(): ContainerBuilder
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('kernel.project_dir', sys_get_temp_dir() . '/missing_vortos_scheduler_config');
+        $container->setParameter('kernel.env', 'test');
+
+        return $container;
     }
 }

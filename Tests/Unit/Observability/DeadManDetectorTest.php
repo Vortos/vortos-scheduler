@@ -24,6 +24,7 @@ use Vortos\Scheduler\Schedule\ScheduleId;
 use Vortos\Scheduler\Schedule\ScheduleSource;
 use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\Trigger;
+use Vortos\Scheduler\Store\PruneResult;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 use Vortos\Scheduler\Tests\Unit\Security\Support\StubAllowlistedCommand;
 
@@ -259,7 +260,7 @@ final class DeadManDetectorTest extends TestCase
             public function findRunState(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\RunState { return null; }
             public function findRunBySlot(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\ScheduleRun { return null; }
             public function transitionRunState(string $runId, \Vortos\Scheduler\Fire\RunState $newState, \DateTimeImmutable $at): void {}
-            public function pruneOldRuns(\DateTimeImmutable $olderThan): int { return 0; }
+            public function pruneOldRuns(\DateTimeImmutable $olderThan, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult { return new PruneResult(0, false); }
         };
 
         $dispatcher = new SpyAlertDispatcher();
@@ -378,7 +379,7 @@ final class DeadManDetectorTest extends TestCase
             public function findRunState(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\RunState { return null; }
             public function findRunBySlot(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\ScheduleRun { return null; }
             public function transitionRunState(string $runId, \Vortos\Scheduler\Fire\RunState $newState, \DateTimeImmutable $at): void {}
-            public function pruneOldRuns(\DateTimeImmutable $olderThan): int { return 0; }
+            public function pruneOldRuns(\DateTimeImmutable $olderThan, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult { return new PruneResult(0, false); }
         };
     }
 

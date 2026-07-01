@@ -29,4 +29,9 @@ enum SchedulerAuditEvent: string
 
     // ── Manual fire (operator-triggered, S9) ──────────────────────────────────
     case FireManual = 'fire.manual'; // manually triggered via scheduler:run-now
+
+    // ── Run retention / auto-prune ──────────────────────────────────────────
+    case RunsPruned              = 'runs.pruned';
+    case RetentionOverrideSet    = 'retention.override_set';
+    case RetentionOverrideRemoved = 'retention.override_removed';
 }

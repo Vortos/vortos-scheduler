@@ -30,6 +30,10 @@ final class SchedulerPermissionCatalog extends AbstractPermissionCatalog
             'scheduler.delete.any'  => ['ROLE_SCHEDULER_ADMIN', 'ROLE_SUPER_ADMIN'],
             'scheduler.run-now.own' => ['ROLE_SCHEDULER_USER', 'ROLE_SCHEDULER_ADMIN', 'ROLE_SUPER_ADMIN'],
             'scheduler.run-now.any' => ['ROLE_SCHEDULER_ADMIN', 'ROLE_SUPER_ADMIN'],
+            // No .own scope: retention policy is a compliance/operator decision about
+            // how long a tenant's audit trail must survive, not something a tenant
+            // should be able to unilaterally shorten or extend for themselves.
+            'scheduler.retention.manage' => ['ROLE_SCHEDULER_ADMIN', 'ROLE_SUPER_ADMIN'],
         ];
     }
 
@@ -46,6 +50,7 @@ final class SchedulerPermissionCatalog extends AbstractPermissionCatalog
             'scheduler.delete.any'  => static::describe('Delete schedule for any tenant', dangerous: true),
             'scheduler.run-now.own' => static::policyRequired('Trigger immediate run for own-tenant schedule', dangerous: true),
             'scheduler.run-now.any' => static::describe('Trigger immediate run for any schedule', dangerous: true),
+            'scheduler.retention.manage' => static::describe('Set or remove a tenant\'s run-retention override', dangerous: true),
         ];
     }
 }

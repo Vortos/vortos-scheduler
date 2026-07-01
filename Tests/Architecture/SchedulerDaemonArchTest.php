@@ -191,7 +191,7 @@ final class SchedulerDaemonArchTest extends TestCase
 
     public function test_di_extension_registers_scheduler_run_command(): void
     {
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         // Without DBAL (no Connection class in env), the daemon registration is
@@ -212,7 +212,7 @@ final class SchedulerDaemonArchTest extends TestCase
             $this->markTestSkipped('DBAL not available.');
         }
 
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         $def  = $container->getDefinition(SchedulerRunCommand::class);
@@ -227,7 +227,7 @@ final class SchedulerDaemonArchTest extends TestCase
             $this->markTestSkipped('DBAL not available.');
         }
 
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         self::assertTrue(
@@ -271,7 +271,7 @@ final class SchedulerDaemonArchTest extends TestCase
             $this->markTestSkipped('DBAL not available.');
         }
 
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         $def  = $container->getDefinition(SchedulerDaemon::class);
@@ -289,7 +289,7 @@ final class SchedulerDaemonArchTest extends TestCase
             $this->markTestSkipped('DBAL not available.');
         }
 
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         $def  = $container->getDefinition(SchedulerDaemon::class);
@@ -307,7 +307,7 @@ final class SchedulerDaemonArchTest extends TestCase
             $this->markTestSkipped('DBAL not available.');
         }
 
-        $container = new ContainerBuilder();
+        $container = $this->newContainer();
         (new SchedulerExtension())->load([], $container);
 
         $def  = $container->getDefinition(SchedulerDaemon::class);
@@ -333,5 +333,18 @@ final class SchedulerDaemonArchTest extends TestCase
         self::assertCount(2, $params);
         self::assertSame(ScheduleId::class, (string) $params[0]->getType());
         self::assertSame('shardCount', $params[1]->getName());
+    }
+
+    /**
+     * SchedulerExtension::load() hard-requires kernel.project_dir/kernel.env (same
+     * convention as CacheExtension, AuthExtension, ... — see CacheExtensionEnvDefaultsTest).
+     */
+    private function newContainer(): ContainerBuilder
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('kernel.project_dir', sys_get_temp_dir() . '/missing_vortos_scheduler_config');
+        $container->setParameter('kernel.env', 'test');
+
+        return $container;
     }
 }

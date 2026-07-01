@@ -42,7 +42,7 @@ return new class extends AbstractModuleSchemaProvider {
         $table->addColumn('command_class',   'text', ['notnull' => true]);
         $table->addColumn('command_payload', 'text', ['notnull' => true]); // JSON
 
-        // RunStamp headers (X-Scheduler-*) for RunCompletionMiddleware
+        // RunStamp headers (X-Scheduler-*) for FireQueueConsumer (S12)
         $table->addColumn('metadata', 'text', ['notnull' => false]); // JSON nullable
 
         // Lifecycle

@@ -103,6 +103,9 @@ final class CardinalityGuardedSchedulerMetricsTest extends TestCase
         $this->guard->recordActiveSchedules(42);
         $this->guard->recordFairnessThrottle('tenant');
         $this->guard->recordAuditFailure('fire_dispatched');
+        $this->guard->recordConsumeResult(true, 'sched-1', null);
+        $this->guard->recordRunsPruned(5, null);
+        $this->guard->recordPruneDuration(1.5, 'auto');
 
         self::assertTrue($this->spy->leaseContentionCalled);
         self::assertTrue($this->spy->leaderAcquiredCalled);
@@ -110,6 +113,7 @@ final class CardinalityGuardedSchedulerMetricsTest extends TestCase
         self::assertSame(42, $this->spy->lastActiveScheduleCount);
         self::assertTrue($this->spy->fairnessThrottleCalled);
         self::assertTrue($this->spy->auditFailureCalled);
+        self::assertSame('sched-1', $this->spy->lastConsumeScheduleId);
     }
 
     public function test_max_distinct_of_one_allows_single_id(): void
@@ -187,5 +191,24 @@ final class SpyMetricsPort implements SchedulerMetricsPort
     public function recordAuditFailure(string $eventType): void
     {
         $this->auditFailureCalled = true;
+    }
+
+    public ?string $lastConsumeScheduleId = null;
+
+    public function recordConsumeResult(bool $success, string $scheduleId, ?string $tenantId): void
+    {
+        $this->lastConsumeScheduleId = $scheduleId;
+    }
+
+    public function recordRunsPruned(int $count, ?string $tenantId): void
+    {
+    }
+
+    public function recordFireQueuePruned(int $count): void
+    {
+    }
+
+    public function recordPruneDuration(float $seconds, string $trigger): void
+    {
     }
 }

@@ -5,12 +5,12 @@ declare(strict_types=1);
 namespace Vortos\Scheduler\Fire;
 
 /**
- * Stamp encoded into the outbox message headers by FireDispatcher.
- * RunCompletionMiddleware reads these headers on the consumer side to
- * locate and transition the ledger row after handler completion.
+ * Stamp encoded into the fire-queue row's `metadata` column by DbalSchedulerEnqueuer.
+ * FireQueueConsumer (S12) decodes these headers to locate and transition the
+ * ledger row after CommandBus dispatch completes.
  *
- * Header constants are the single source of truth — no magic strings
- * scattered across DbalSchedulerEnqueuer and RunCompletionMiddleware.
+ * Header constants are the single source of truth — no magic strings scattered
+ * across DbalSchedulerEnqueuer and FireQueueConsumer.
  */
 final readonly class RunStamp
 {

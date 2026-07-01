@@ -21,9 +21,10 @@ final class SchedulerPermissionCatalogTest extends TestCase
         'scheduler.delete.any',
         'scheduler.run-now.own',
         'scheduler.run-now.any',
+        'scheduler.retention.manage',
     ];
 
-    public function test_all_ten_permissions_are_declared(): void
+    public function test_all_eleven_permissions_are_declared(): void
     {
         $grants = SchedulerPermissionCatalog::grants();
 
@@ -31,7 +32,17 @@ final class SchedulerPermissionCatalogTest extends TestCase
             self::assertArrayHasKey($permission, $grants, "Missing permission: {$permission}");
         }
 
-        self::assertCount(10, $grants);
+        self::assertCount(11, $grants);
+    }
+
+    public function test_retention_manage_has_no_own_scope_and_is_admin_only(): void
+    {
+        $grants = SchedulerPermissionCatalog::grants();
+
+        self::assertArrayNotHasKey('scheduler.retention.manage.own', $grants);
+        self::assertNotContains('ROLE_SCHEDULER_USER', $grants['scheduler.retention.manage']);
+        self::assertContains('ROLE_SCHEDULER_ADMIN', $grants['scheduler.retention.manage']);
+        self::assertContains('ROLE_SUPER_ADMIN', $grants['scheduler.retention.manage']);
     }
 
     public function test_own_permissions_include_scheduler_user_role(): void

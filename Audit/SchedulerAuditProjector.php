@@ -250,6 +250,71 @@ final class SchedulerAuditProjector
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Run retention / auto-prune
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Records one prune sweep. Uses tryAppend() deliberately: by the time this is
+     * called the delete has already happened and cannot be undone, so failing the
+     * command over an audit-write hiccup would misreport a successful prune as a
+     * failure. See SCHEDULER_AUTO_PRUNE_IMPL_PLAN.md item 5.
+     */
+    public function onRunsPruned(
+        string $actorId,
+        ?string $tenantId,
+        int $deletedCount,
+        DateTimeImmutable $cutoff,
+        bool $truncated,
+        bool $resolved = true,
+    ): void {
+        $this->tryAppend(
+            SchedulerAuditEvent::RunsPruned,
+            $actorId,
+            $tenantId,
+            null,
+            null,
+            null,
+            [
+                'deleted_count' => $deletedCount,
+                'cutoff'        => $cutoff->format(DateTimeInterface::ATOM),
+                'truncated'     => $truncated,
+                // false only for the manual --before bypass, which skips the
+                // per-tenant/global resolver entirely (SchedulePruneCommand).
+                'resolved'      => $resolved,
+            ],
+        );
+    }
+
+    /**
+     * Operator mutation — exceptions propagate (same contract as onSchedulePaused/etc).
+     */
+    public function onRetentionOverrideSet(string $tenantId, int $retentionDays, string $actorId, ?string $reason): void
+    {
+        $this->append(
+            SchedulerAuditEvent::RetentionOverrideSet,
+            $actorId,
+            $tenantId,
+            null,
+            null,
+            null,
+            ['retention_days' => $retentionDays, 'reason' => $reason],
+        );
+    }
+
+    public function onRetentionOverrideRemoved(string $tenantId, string $actorId): void
+    {
+        $this->append(
+            SchedulerAuditEvent::RetentionOverrideRemoved,
+            $actorId,
+            $tenantId,
+            null,
+            null,
+            null,
+            [],
+        );
+    }
+
         // ─────────────────────────────────────────────────────────────────────────
     // Private: core append logic
     // ─────────────────────────────────────────────────────────────────────────

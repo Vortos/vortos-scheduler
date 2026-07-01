@@ -24,7 +24,7 @@ The Vortos Scheduler is a leader-elected, sharded cron/interval dispatcher backe
 | `vortos_scheduler_leases` | SQL-backed lease store (alternative to Redis/Postgres advisory) |
 | `vortos_scheduler_audit_log` | HMAC-chained audit trail |
 | `vortos_scheduler_audit_checkpoints` | Per-epoch audit chain checkpoints (S11) |
-| `vortos_scheduler_fire_queue` | Outbox for dispatched commands |
+| `vortos_scheduler_fire_queue` | Outbox for dispatched commands (terminal rows auto-pruned — see `SCHEDULER_FIRE_QUEUE_RETENTION_DAYS`) |
 | `vortos_scheduler_static_overrides` | Operator pause/resume of static schedules |
 | `vortos_scheduler_approvals` | 4-eyes approval records |
 
@@ -42,6 +42,8 @@ The Vortos Scheduler is a leader-elected, sharded cron/interval dispatcher backe
 | `SCHEDULER_ASSUMED_DONE_TTL_SECONDS` | `3600` | TTL after which an in-flight run is assumed done |
 | `SCHEDULER_AUDIT_HMAC_KEY` | *(required for audit)* | Secret key for HMAC chain signing |
 | `SCHEDULER_AUDIT_EPOCH_SIZE` | `1000` | Entries between audit checkpoints |
+| `SCHEDULER_RUN_RETENTION_DAYS` | `30` | Global retention for `vortos_scheduler_runs`; drives the daily auto-prune (0 disables) |
+| `SCHEDULER_FIRE_QUEUE_RETENTION_DAYS` | `7` | Retention for terminal `vortos_scheduler_fire_queue` rows, pruned during the daily auto-prune (0 disables; needs run retention > 0 for the schedule to exist) |
 | `SCHEDULER_DEADMAN_TOLERANCE_SEC` | `300` | Late-fire tolerance before dead-man alert |
 | `SCHEDULER_CB_FAILURE_THRESHOLD` | `5` | Circuit-breaker open threshold (consecutive failures) |
 | `SCHEDULER_CB_RECOVERY_WINDOW_SEC` | `30` | Circuit-breaker half-open window |

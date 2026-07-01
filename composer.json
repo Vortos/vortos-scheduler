@@ -1,6 +1,6 @@
 {
     "name": "vortos/vortos-scheduler",
-    "description": "Vortos Scheduler — in-app leader-elected distributed scheduler. Recurring + one-shot + interval triggers, static (compile-time) and dynamic (DB-stored) schedules, agnostic LeasePort (SQL/Redis/PG-advisory), idempotent fire-to-CommandBus, misfire + overlap policies, hash-chained audit, OTel, dead-man detection, RBAC + 4-eyes.",
+    "description": "Vortos Scheduler — in-app leader-elected distributed scheduler. Recurring + one-shot + interval triggers, static (compile-time) and dynamic (DB-stored) schedules, agnostic LeasePort (SQL/Redis/PG-advisory), idempotent fire-to-CommandBus, misfire + overlap policies, hash-chained audit, OTel, dead-man detection, RBAC + 4-eyes, fire-queue CQRS consumer, auto-prune retention.",
     "type": "library",
     "license": "MIT",
     "autoload": {
@@ -18,19 +18,19 @@
         "dragonmantank/cron-expression": "^3.3",
         "vortos/vortos-foundation": "^1.0",
         "vortos/vortos-ops-kit": "^1.0",
-        "vortos/vortos-domain": "^1.0",
-        "vortos/vortos-messaging": "^1.0"
+        "vortos/vortos-domain": "^1.0"
     },
     "suggest": {
-        "doctrine/dbal": "Required for the default DBAL schedule store, run-ledger, and SQL lease driver (S3).",
+        "doctrine/dbal": "Required for the default DBAL schedule store, run-ledger, SQL lease driver (S3), and auto-prune retention overrides.",
         "ext-redis": "For the Redis LeasePort driver (S2).",
         "ext-pgsql": "For the Postgres advisory-lock LeasePort driver (S2).",
         "vortos/vortos-observability": "Hash-chain audit ledger + OTel spans per fire (S8).",
         "vortos/vortos-alerts": "Dead-man detector raises a meta-alert when a schedule misses its window (S8).",
-        "vortos/vortos-authorization": "RBAC gate for create/edit/pause/run-now; 4-eyes for sensitive schedules (S7).",
+        "vortos/vortos-authorization": "RBAC gate for create/edit/pause/run-now/retention; 4-eyes for sensitive schedules (S7).",
         "vortos/vortos-tenant": "Per-tenant dynamic schedules with isolation/residency.",
         "vortos/vortos-secrets": "Off-host custody for audit HMAC key and lease-store credentials.",
-        "vortos/vortos-scheduler-admin": "HTMX + Twig admin UI (S10)."
+        "vortos/vortos-scheduler-admin": "HTMX + Twig admin UI (S10).",
+        "vortos/vortos-cqrs": "Required for the fire-queue consumer (S12) — dispatches allowlisted scheduled commands through the CQRS CommandBus. Without it, fired schedules are recorded in the ledger but never executed; see SchedulerDoctor C11."
     },
     "require-dev": {
         "phpunit/phpunit": "^11.0"

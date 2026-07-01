@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Vortos\Scheduler\Doctor;
 
 use DateTimeImmutable;
+use DateTimeInterface;
 use Doctrine\DBAL\Connection;
 use Vortos\Scheduler\Clock\ClockPort;
+use Vortos\Scheduler\Fire\RunState;
 use Vortos\Scheduler\Lease\LeasePort;
 use Vortos\Scheduler\Lease\LeaseToken;
+use Vortos\Scheduler\Registry\PruneSchedulerRunsSchedule;
 use Vortos\Scheduler\Registry\ScheduleResolver;
 use Vortos\Scheduler\Schedule\Policy\FireEachMissed;
 use Vortos\Scheduler\Schedule\Policy\SkipMissed;
@@ -19,18 +22,23 @@ use Vortos\Scheduler\Security\Approval\ApprovalAction;
 use Vortos\Scheduler\Security\Approval\ApprovalStatus;
 use Vortos\Scheduler\Security\Approval\FourEyesApprovalStoreInterface;
 use Vortos\Scheduler\Security\CommandSpecValidator;
+use Vortos\Scheduler\Store\RunRetentionOverride;
+use Vortos\Scheduler\Store\RunRetentionOverrideStoreInterface;
 use Vortos\Scheduler\Store\ScheduleStoreInterface;
 
 /**
  * Fail-closed preflight health inspector for the scheduler subsystem.
  *
- * Runs 9 checks (C1–C9) that cover cron validity, name collisions,
+ * Runs 11 checks (C1–C11) that cover cron validity, name collisions,
  * command allowlisting, lease driver reachability, migration state,
  * 4-eyes approval coverage, misfire policy safety, catchup bounds,
- * and shard lease probe.
+ * shard lease probe, auto-prune config + liveness (C10), and fire-queue
+ * consumer liveness (C11, S12).
  */
 final class SchedulerDoctor implements SchedulerDoctorPort
 {
+    private const PRUNE_LIVENESS_STALE_HOURS = 48;
+
     public function __construct(
         private readonly ScheduleResolver                  $resolver,
         private readonly ScheduleStoreInterface            $dynamicStore,
@@ -42,6 +50,14 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         private readonly string                            $tablePrefix = 'vortos_',
         private readonly int                               $shardCount = 1,
         private readonly int                               $maxCatchupAgeSec = 86400,
+        // Default 0 (disabled), not the app-level default of 30: this constructor
+        // default only matters for callers that don't pass it explicitly (mainly
+        // tests exercising other checks) — 0 skips C10's table queries entirely,
+        // so it never assumes a `scheduler_runs` schema it wasn't given.
+        private readonly int                               $runRetentionDays = 0,
+        private readonly ?RunRetentionOverrideStoreInterface $retentionOverrideStore = null,
+        private readonly bool                              $fireQueueConsumerInstalled = false,
+        private readonly int                               $consumeStallThresholdSec = 120,
     ) {}
 
     public function run(): SchedulerDoctorReport
@@ -63,6 +79,8 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $this->checkSensitiveHaveExplicitMisfirePolicy($allSchedules),
             $this->checkCatchupBoundsValid($allSchedules),
             $this->checkShardConfigValid(),
+            $this->checkRetentionStatusValid($now),
+            $this->checkFireQueueConsumerHealthy($now),
         ];
 
         return new SchedulerDoctorReport($findings);
@@ -254,7 +272,10 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $this->tablePrefix . 'scheduler_schedules',
             $this->tablePrefix . 'scheduler_runs',
             $this->tablePrefix . 'scheduler_audit_log',
+            $this->tablePrefix . 'scheduler_audit_checkpoints',
             $this->tablePrefix . 'scheduler_static_overrides',
+            $this->tablePrefix . 'scheduler_fire_queue',
+            $this->tablePrefix . 'scheduler_run_retention_overrides',
         ];
 
         $missing = [];
@@ -476,6 +497,144 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             'C9',
             SchedulerDoctorStatus::Pass,
             sprintf('Shard config valid; all %d shard probe(s) succeeded.', $this->shardCount),
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // C10 — Auto-prune config + liveness
+    //
+    // Deliberately proves the feature is actually working, not just configured:
+    // "auto-prune active, retention = 30 days" while nothing has ever fired would
+    // be false confidence given the fire-queue-consumer gap C11 exists to catch.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function checkRetentionStatusValid(DateTimeImmutable $now): SchedulerDoctorFinding
+    {
+        if ($this->runRetentionDays <= 0) {
+            return new SchedulerDoctorFinding(
+                'C10',
+                SchedulerDoctorStatus::Pass,
+                'Auto-prune disabled (SCHEDULER_RUN_RETENTION_DAYS=0).',
+            );
+        }
+
+        $overrides = $this->retentionOverrideStore?->findAll() ?? [];
+        $overrideLines = array_map(
+            static fn (RunRetentionOverride $o) => sprintf(
+                '%s → %s',
+                $o->tenantId,
+                $o->isExempt() ? '0 days [legal hold]' : $o->retentionDays . ' days',
+            ),
+            $overrides,
+        );
+
+        $scheduleId = PruneSchedulerRunsSchedule::SCHEDULE_ID;
+        $runsTable  = $this->tablePrefix . 'scheduler_runs';
+
+        $attemptCount = (int) $this->connection->fetchOne(
+            "SELECT COUNT(*) FROM {$runsTable} WHERE schedule_id = ?",
+            [$scheduleId],
+        );
+
+        if ($attemptCount === 0) {
+            return new SchedulerDoctorFinding(
+                'C10',
+                SchedulerDoctorStatus::Skip,
+                'Auto-prune is configured but has not fired yet — expected before the next scheduled run.',
+                sprintf('Global retention = %d days, %d tenant override(s).', $this->runRetentionDays, count($overrides)),
+            );
+        }
+
+        $lastCompletedRaw = $this->connection->fetchOne(
+            "SELECT MAX(completed_at) FROM {$runsTable} WHERE schedule_id = ? AND run_state = ?",
+            [$scheduleId, RunState::Completed->value],
+        );
+
+        $lastCompletedAt = ($lastCompletedRaw !== false && $lastCompletedRaw !== null)
+            ? new DateTimeImmutable((string) $lastCompletedRaw)
+            : null;
+
+        if ($lastCompletedAt === null
+            || $lastCompletedAt->modify(sprintf('+%d hours', self::PRUNE_LIVENESS_STALE_HOURS)) < $now) {
+            return new SchedulerDoctorFinding(
+                'C10',
+                SchedulerDoctorStatus::Fail,
+                $lastCompletedAt === null
+                    ? 'Auto-prune has attempted to fire but has never completed successfully.'
+                    : sprintf(
+                        'Auto-prune has not completed successfully in >%dh (last: %s).',
+                        self::PRUNE_LIVENESS_STALE_HOURS,
+                        $lastCompletedAt->format(DateTimeInterface::ATOM),
+                    ),
+                sprintf('Global retention = %d days, %d tenant override(s).', $this->runRetentionDays, count($overrides)),
+                'Check that scheduler:consume --loop is running (see C11) and inspect '
+                . 'vortos_scheduler_audit_log for runs.pruned entries.',
+            );
+        }
+
+        return new SchedulerDoctorFinding(
+            'C10',
+            SchedulerDoctorStatus::Pass,
+            sprintf(
+                'Auto-prune active, global retention = %d days, %d tenant override(s); last completed %s.',
+                $this->runRetentionDays,
+                count($overrides),
+                $lastCompletedAt->format(DateTimeInterface::ATOM),
+            ),
+            implode("\n", $overrideLines),
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // C11 — Fire-queue consumer liveness (S12)
+    //
+    // Generic health signal for the gap found while building auto-prune: nothing
+    // consumed vortos_scheduler_fire_queue, so no scheduled command ever ran. This
+    // check catches that class of failure for ANY schedule, not just prune.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function checkFireQueueConsumerHealthy(DateTimeImmutable $now): SchedulerDoctorFinding
+    {
+        if (!$this->fireQueueConsumerInstalled) {
+            return new SchedulerDoctorFinding(
+                'C11',
+                SchedulerDoctorStatus::Skip,
+                'CQRS CommandBus not installed — fire-queue consumer check skipped.',
+            );
+        }
+
+        $queueTable = $this->tablePrefix . 'scheduler_fire_queue';
+
+        $oldestPendingRaw = $this->connection->fetchOne(
+            "SELECT MIN(created_at) FROM {$queueTable} WHERE status = 'pending'",
+        );
+
+        if ($oldestPendingRaw === false || $oldestPendingRaw === null) {
+            return new SchedulerDoctorFinding('C11', SchedulerDoctorStatus::Pass, 'Fire queue is empty — draining normally.');
+        }
+
+        $oldestAt = new DateTimeImmutable((string) $oldestPendingRaw);
+        $ageSec   = $now->getTimestamp() - $oldestAt->getTimestamp();
+
+        if ($ageSec <= $this->consumeStallThresholdSec) {
+            return new SchedulerDoctorFinding(
+                'C11',
+                SchedulerDoctorStatus::Pass,
+                sprintf('Fire queue draining normally (oldest pending row: %ds old).', $ageSec),
+            );
+        }
+
+        $pendingCount = (int) $this->connection->fetchOne(
+            "SELECT COUNT(*) FROM {$queueTable} WHERE status = 'pending'",
+        );
+
+        return new SchedulerDoctorFinding(
+            'C11',
+            SchedulerDoctorStatus::Fail,
+            sprintf('%d row(s) pending in the fire queue; oldest is %ds old.', $pendingCount, $ageSec),
+            '',
+            'The fire-queue consumer (scheduler:consume --loop) does not appear to be running or is '
+            . 'falling behind — scheduled commands are not executing.',
         );
     }
 }

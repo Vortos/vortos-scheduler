@@ -45,6 +45,23 @@ final class SchedulePolicy implements SchedulePolicyInterface
         $this->assertPermission($identity, 'scheduler.run-now', $schedule);
     }
 
+    public function assertCanManageRetention(UserIdentityInterface $identity, ?string $tenantId): void
+    {
+        if ($this->policyEngine->can($identity, 'scheduler.retention.manage')) {
+            return;
+        }
+
+        throw new ScheduleAccessDeniedException(
+            action: 'retention.manage',
+            identityId: $identity->id(),
+        );
+    }
+
+    public function canManageRetention(UserIdentityInterface $identity, ?string $tenantId): bool
+    {
+        return $this->policyEngine->can($identity, 'scheduler.retention.manage');
+    }
+
     public function canCreate(UserIdentityInterface $identity, Schedule $schedule): bool
     {
         return $this->checkPermission($identity, 'scheduler.create', $schedule);
