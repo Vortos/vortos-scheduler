@@ -95,7 +95,7 @@ final class SchedulerDaemonArchTest extends TestCase
         $required = [
             'leasePort',
             'scheduleResolver',
-            'runStore',
+            'cursorStore',
             'dueScan',
             'fireDispatcher',
             'clock',

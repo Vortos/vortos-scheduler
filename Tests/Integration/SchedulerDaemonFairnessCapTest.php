@@ -28,6 +28,7 @@ use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\OneShotTrigger;
 use Vortos\Scheduler\Registry\ScheduleResolver;
 use Vortos\Scheduler\Registry\StaticScheduleRegistry;
+use Vortos\Scheduler\Store\Dbal\DbalScheduleCursorStore;
 use Vortos\Scheduler\Store\Dbal\DbalScheduleRunStore;
 use Vortos\Scheduler\Store\ScheduleStoreInterface;
 use Vortos\Scheduler\Testing\RecordingSchedulerEnqueuer;
@@ -55,7 +56,8 @@ use Vortos\Scheduler\Testing\RecordingSchedulerEnqueuer;
  */
 final class SchedulerDaemonFairnessCapTest extends TestCase
 {
-    private const RUNS_TABLE = 'vortos_scheduler_runs';
+    private const RUNS_TABLE    = 'vortos_scheduler_runs';
+    private const CURSORS_TABLE = 'vortos_scheduler_cursors';
 
     private Connection                 $connection;
     private RecordingSchedulerEnqueuer $enqueuer;
@@ -271,10 +273,17 @@ final class SchedulerDaemonFairnessCapTest extends TestCase
         $scheduleStore    = $this->makeScheduleStore($schedules);
         $scheduleResolver = new ScheduleResolver(new StaticScheduleRegistry(), $scheduleStore);
 
+        // Seed cadence cursors 1h before the clock so the due (now−30s) one-shots fall in-window.
+        $cursorStore = new DbalScheduleCursorStore($this->connection, self::CURSORS_TABLE);
+        $seedAt      = $clock->now()->modify('-3600 seconds');
+        foreach ($schedules as $s) {
+            $cursorStore->advance($s->id, $s->tenantId, $seedAt, 0);
+        }
+
         return new SchedulerDaemon(
             leasePort:               $leaseStore,
             scheduleResolver:        $scheduleResolver,
-            runStore:                $runStore,
+            cursorStore:             $cursorStore,
             dueScan:                 $dueScan,
             fireDispatcher:          $dispatcher,
             clock:                   $clock,
@@ -411,6 +420,18 @@ final class SchedulerDaemonFairnessCapTest extends TestCase
             CREATE INDEX IF NOT EXISTS idx_{$t}_schedule_dispatched
                 ON {$t} (schedule_id, dispatched_at)
         ");
+
+        $c = self::CURSORS_TABLE;
+        $this->connection->executeStatement("
+            CREATE TABLE IF NOT EXISTS {$c} (
+                schedule_id    VARCHAR(36)  NOT NULL,
+                tenant_id      VARCHAR(255) NULL,
+                cursor_at      TIMESTAMPTZ  NOT NULL,
+                cursor_version INTEGER      NOT NULL DEFAULT 1,
+                updated_at     TIMESTAMPTZ  NOT NULL,
+                CONSTRAINT pk_{$c} PRIMARY KEY (schedule_id)
+            )
+        ");
     }
 
     private function cleanCreatedRows(): void
@@ -424,6 +445,10 @@ final class SchedulerDaemonFairnessCapTest extends TestCase
             $ids          = array_map(fn (ScheduleId $id) => $id->toString(), $this->createdIds);
             $this->connection->executeStatement(
                 "DELETE FROM " . self::RUNS_TABLE . " WHERE schedule_id IN ({$placeholders})",
+                $ids,
+            );
+            $this->connection->executeStatement(
+                "DELETE FROM " . self::CURSORS_TABLE . " WHERE schedule_id IN ({$placeholders})",
                 $ids,
             );
         } catch (Throwable) {

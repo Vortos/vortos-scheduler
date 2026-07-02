@@ -28,21 +28,25 @@ final class DueScan
     ) {}
 
     /**
-     * @param  list<Schedule>          $schedules           Active schedules to evaluate
-     * @param  array<string, string>   $lastSlotBySchedule  Map from scheduleId → lastSlotKey
-     * @param  DateTimeImmutable       $now                 Monotonic wall-clock snapshot
-     * @param  int|null                $shardIndex          0-based shard index (null = no shard)
-     * @param  int|null                $shardCount          Total shard count (null = no shard)
+     * @param  list<Schedule>                  $schedules         Active schedules to evaluate
+     * @param  array<string, DateTimeImmutable> $cursorBySchedule Map from scheduleId → cadence cursor.
+     *                                                            Must contain an entry for every
+     *                                                            active schedule (the daemon anchors
+     *                                                            never-scanned schedules to `now`).
+     * @param  DateTimeImmutable               $now               Monotonic wall-clock snapshot
+     * @param  int|null                        $shardIndex        0-based shard index (null = no shard)
+     * @param  int|null                        $shardCount        Total shard count (null = no shard)
      */
     public function compute(
         array             $schedules,
-        array             $lastSlotBySchedule,
+        array             $cursorBySchedule,
         DateTimeImmutable $now,
         ?int              $shardIndex = null,
         ?int              $shardCount = null,
     ): DueScanResult {
-        $fires   = [];
-        $dropped = [];
+        $fires      = [];
+        $dropped    = [];
+        $newCursors = [];
 
         foreach ($schedules as $schedule) {
             if (!$schedule->isActive()) {
@@ -53,25 +57,28 @@ final class DueScan
                 continue;
             }
 
-            $lastSlotKey = $lastSlotBySchedule[$schedule->id->toString()] ?? null;
+            // A missing cursor means "never scanned" → anchor to now (no retroactive catch-up).
+            $cursor = $cursorBySchedule[$schedule->id->toString()] ?? $now;
 
             $result = $this->misfireResolver->resolve(
                 schedule:         $schedule,
-                lastSlotKey:      $lastSlotKey,
+                cursor:           $cursor,
                 now:              $now,
                 maxCatchupAgeSec: $this->maxCatchupAgeSec,
             );
 
-            foreach ($result['fires'] as $fire) {
+            foreach ($result->fires as $fire) {
                 $fires[] = $fire;
             }
 
-            foreach ($result['dropped'] as $drop) {
+            foreach ($result->dropped as $drop) {
                 $dropped[] = $drop;
             }
+
+            $newCursors[$schedule->id->toString()] = $result->newCursor;
         }
 
-        return new DueScanResult(fires: $fires, dropped: $dropped);
+        return new DueScanResult(fires: $fires, dropped: $dropped, newCursors: $newCursors);
     }
 
     private function belongsToShard(Schedule $schedule, ?int $shardIndex, ?int $shardCount): bool

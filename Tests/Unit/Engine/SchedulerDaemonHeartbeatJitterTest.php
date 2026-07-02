@@ -22,12 +22,11 @@ use Vortos\Scheduler\Schedule\ScheduleSource;
 use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\IntervalTrigger;
 use Vortos\Scheduler\Testing\FakeFireDispatcherPort;
+use Vortos\Scheduler\Testing\InMemoryScheduleCursorStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStore;
 use Vortos\Scheduler\Registry\StaticScheduleRegistry;
 use Vortos\Scheduler\Registry\ScheduleResolver;
-use Vortos\Scheduler\Store\PruneResult;
-use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 
 /**
  * Unit tests for SchedulerDaemon heartbeat guard and node-seeded jitter (E2, E6).
@@ -109,8 +108,12 @@ final class SchedulerDaemonHeartbeatJitterTest extends TestCase
         $schedule = $this->makeSchedule(new DateTimeImmutable('2026-07-01T09:00:00Z', new DateTimeZone('UTC')));
         $store->seed($schedule);
 
+        // Seed a cadence cursor 2h before the clock (now = 10:00) so two hourly slots are due.
+        $cursorStore = new InMemoryScheduleCursorStore();
+        $cursorStore->seed($schedule->id, null, new DateTimeImmutable('2026-07-01T08:00:00Z', new DateTimeZone('UTC')));
+
         $dispatcher = new FakeFireDispatcherPort();
-        $daemon     = $this->makeDaemon(store: $store, dispatcher: $dispatcher);
+        $daemon     = $this->makeDaemon(store: $store, dispatcher: $dispatcher, cursorStore: $cursorStore);
 
         $daemon->runOnce();
 
@@ -120,8 +123,9 @@ final class SchedulerDaemonHeartbeatJitterTest extends TestCase
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private function makeDaemon(
-        ?InMemoryScheduleStore $store      = null,
-        ?FireDispatcherPort    $dispatcher = null,
+        ?InMemoryScheduleStore       $store       = null,
+        ?FireDispatcherPort          $dispatcher  = null,
+        ?InMemoryScheduleCursorStore $cursorStore = null,
         int $shardCount  = 1,
         int $leaseTtlSec = 30,
         int $maxIdleSec  = 60,
@@ -135,9 +139,9 @@ final class SchedulerDaemonHeartbeatJitterTest extends TestCase
             new InMemoryScheduleStatusOverrideStore(),
         );
 
-        $dispatcher ??= new FakeFireDispatcherPort();
-        $runStore    = new InMemoryScheduleRunStore();
-        $dueScan     = new \Vortos\Scheduler\Engine\DueScan(
+        $dispatcher  ??= new FakeFireDispatcherPort();
+        $cursorStore ??= new InMemoryScheduleCursorStore();
+        $dueScan       = new \Vortos\Scheduler\Engine\DueScan(
             new \Vortos\Scheduler\Engine\MisfireResolver(new \Vortos\Scheduler\Engine\SlotCalculator()),
             86400,
         );
@@ -145,7 +149,7 @@ final class SchedulerDaemonHeartbeatJitterTest extends TestCase
         return new SchedulerDaemon(
             leasePort:                $leaseStore,
             scheduleResolver:         $resolver,
-            runStore:                 $runStore,
+            cursorStore:              $cursorStore,
             dueScan:                  $dueScan,
             fireDispatcher:           $dispatcher,
             clock:                    $this->clock,
@@ -174,17 +178,4 @@ final class SchedulerDaemonHeartbeatJitterTest extends TestCase
             tenantId: null,
         );
     }
-}
-
-// ── In-memory run store for daemon tests ─────────────────────────────────────
-
-final class InMemoryScheduleRunStore implements ScheduleRunStoreInterface
-{
-    public function insertRun(\Vortos\Scheduler\Fire\ScheduleRun $run): void {}
-    public function findLastSlots(array $scheduleIds, ?string $tenantId): array { return []; }
-    public function findRunState(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\RunState { return null; }
-    public function findRunBySlot(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\ScheduleRun { return null; }
-    public function transitionRunState(string $runId, \Vortos\Scheduler\Fire\RunState $newState, \DateTimeImmutable $at): void {}
-    public function pruneOldRuns(\DateTimeImmutable $before, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult { return new PruneResult(0, false); }
-    public function findLastDispatchTimes(array $scheduleIds, ?string $tenantId): array { return []; }
 }

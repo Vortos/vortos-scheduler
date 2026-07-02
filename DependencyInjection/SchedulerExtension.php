@@ -52,6 +52,7 @@ use Vortos\Scheduler\Observability\SchedulerMetrics;
 use Vortos\Scheduler\Observability\SchedulerMetricsPort;
 use Vortos\Scheduler\Observability\SchedulerTracer;
 use Vortos\Scheduler\Store\Dbal\DbalRunRetentionOverrideStore;
+use Vortos\Scheduler\Store\Dbal\DbalScheduleCursorStore;
 use Vortos\Scheduler\Store\Dbal\DbalScheduleRunStore;
 use Vortos\Scheduler\Store\Dbal\DbalScheduleStore;
 use Vortos\Scheduler\Store\Dbal\ScheduleSerializer;
@@ -71,6 +72,7 @@ use Vortos\Scheduler\Security\SchedulePolicy;
 use Vortos\Scheduler\Security\SchedulePolicyInterface;
 use Vortos\Scheduler\Security\SchedulerPermissionCatalog;
 use Vortos\Scheduler\Security\SchedulerResourcePolicy;
+use Vortos\Scheduler\Store\ScheduleCursorStoreInterface;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 use Vortos\Scheduler\Store\ScheduleStoreInterface;
 use Vortos\Tracing\Contract\TracingInterface;
@@ -222,9 +224,15 @@ final class SchedulerExtension extends Extension
             ->setArgument('$table', $prefix . 'scheduler_run_retention_overrides')
             ->setPublic(false);
 
+        $container->register(DbalScheduleCursorStore::class, DbalScheduleCursorStore::class)
+            ->setArgument('$connection', new Reference(Connection::class))
+            ->setArgument('$table', $prefix . 'scheduler_cursors')
+            ->setPublic(false);
+
         $container->setAlias(ScheduleStoreInterface::class, DbalScheduleStore::class);
         $container->setAlias(ScheduleRunStoreInterface::class, DbalScheduleRunStore::class);
         $container->setAlias(RunRetentionOverrideStoreInterface::class, DbalRunRetentionOverrideStore::class);
+        $container->setAlias(ScheduleCursorStoreInterface::class, DbalScheduleCursorStore::class);
     }
 
     private function registerEngine(ContainerBuilder $container, array $config): void
@@ -450,7 +458,7 @@ final class SchedulerExtension extends Extension
         $container->register(SchedulerDaemon::class, SchedulerDaemon::class)
             ->setArgument('$leasePort',               new Reference(LeasePort::class))
             ->setArgument('$scheduleResolver',        new Reference(ScheduleResolver::class))
-            ->setArgument('$runStore',                new Reference(ScheduleRunStoreInterface::class))
+            ->setArgument('$cursorStore',             new Reference(ScheduleCursorStoreInterface::class))
             ->setArgument('$dueScan',                 new Reference(DueScan::class))
             ->setArgument('$fireDispatcher',          new Reference(FireDispatcher::class))
             ->setArgument('$clock',                   new Reference(ClockPort::class))

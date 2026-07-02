@@ -15,9 +15,14 @@ use Vortos\Scheduler\Schedule\Schedule;
 /**
  * Pure engine — no I/O, no DBAL, no clock calls.
  *
- * Given a schedule, its last fired slot key, and the current time,
- * returns the set of ScheduledFires to dispatch plus any slots that
- * were dropped for being beyond the max_catchup_age horizon.
+ * Given a schedule, its persisted cadence cursor, and the current time, returns the set of
+ * ScheduledFires to dispatch, any slots dropped for exceeding the max_catchup_age horizon, and
+ * the advanced cursor to persist once those fires are dispatched.
+ *
+ * The cursor is first-class, typed state supplied by the caller (never reconstructed by parsing a
+ * slot key out of the execution log) and is always non-null: a never-yet-scanned schedule is
+ * anchored to its activation instant by the daemon, NOT to the catch-up horizon. The horizon is a
+ * cap on genuine catch-up gaps only.
  *
  * MisfireResolver MUST remain dependency-free of any infrastructure
  * (enforced by SchedulerPurityArchTest).
@@ -28,40 +33,37 @@ final class MisfireResolver
         private readonly SlotCalculator $slotCalculator,
     ) {}
 
-    /**
-     * @return array{fires: list<ScheduledFire>, dropped: list<DroppedSlotRecord>}
-     */
     public function resolve(
         Schedule          $schedule,
-        ?string           $lastSlotKey,
+        DateTimeImmutable $cursor,
         DateTimeImmutable $now,
         int               $maxCatchupAgeSec = 86400,
-    ): array {
-        $horizon      = $now->modify("-{$maxCatchupAgeSec} seconds");
-        $lastFireTime = $this->parseLastFireTime($lastSlotKey);
+    ): MisfireResolution {
+        $horizon = $now->modify("-{$maxCatchupAgeSec} seconds");
 
-        // Anything before the horizon is unreachable — jump cursor to horizon.
-        // Slots between lastFireTime and horizon are noted as a batch drop.
+        // Anything before the horizon is unreachable — jump the working cursor to horizon and
+        // note the batch drop. This is the horizon's ONLY role: capping a genuine catch-up gap.
         $dropped = [];
-        if ($lastFireTime !== null && $lastFireTime < $horizon) {
+        if ($cursor < $horizon) {
             $dropped[] = new DroppedSlotRecord(
                 scheduleId: $schedule->id,
                 tenantId:   $schedule->tenantId,
                 droppedAt:  $horizon,
                 reason:     DroppedSlotRecord::REASON_BEYOND_HORIZON,
             );
-            $cursor = $horizon;
+            $workCursor = $horizon;
         } else {
-            $cursor = $lastFireTime ?? $horizon;
+            $workCursor = $cursor;
         }
 
-        // Enumerate all trigger slots in the half-open interval ($cursor, $now].
-        $fires       = [];
+        // Enumerate all trigger slots in the half-open interval ($workCursor, $now].
+        $candidates    = [];
         $maxIterations = 50_000;
-        $iterations  = 0;
+        $iterations    = 0;
+        $enumCursor    = $workCursor;
 
         while ($iterations++ < $maxIterations) {
-            $next = $schedule->trigger->nextRunAfter($cursor);
+            $next = $schedule->trigger->nextRunAfter($enumCursor);
 
             if ($next === null || $next > $now) {
                 break;
@@ -69,23 +71,24 @@ final class MisfireResolver
 
             $slot = $this->slotCalculator->slotKey($schedule->id, $next, $schedule->timezone);
 
-            $fires[] = new ScheduledFire(
+            $candidates[] = new ScheduledFire(
                 scheduleId:   $schedule->id,
                 tenantId:     $schedule->tenantId,
                 slot:         $slot,
                 scheduledFor: $next,
             );
 
-            $cursor = $next;
+            $enumCursor = $next;
         }
 
-        $fires = $this->applyPolicy($schedule->misfire, $fires);
+        $fires     = $this->applyPolicy($schedule->misfire, $candidates);
+        $newCursor = $this->computeNewCursor($schedule->misfire, $candidates, $fires, $now, $workCursor);
 
-        return ['fires' => $fires, 'dropped' => $dropped];
+        return new MisfireResolution(fires: $fires, dropped: $dropped, newCursor: $newCursor);
     }
 
     /**
-     * @param  list<ScheduledFire> $candidates   All slots in (lastFire, now] sorted ASC
+     * @param  list<ScheduledFire> $candidates   All slots in ($cursor, now] sorted ASC
      * @return list<ScheduledFire>
      */
     private function applyPolicy(MisfirePolicy $policy, array $candidates): array
@@ -115,33 +118,31 @@ final class MisfireResolver
     }
 
     /**
-     * Extracts the scheduledFor instant from a slot key.
+     * The cursor advances to the instant up to which cadence is settled.
      *
-     * Slot key format: "<36-char-uuid>:<ISO-8601-with-offset>"
-     * UUID is always 36 characters (8-4-4-4-12 with dashes), so the colon
-     * is at index 36 and the datetime string starts at index 37.
+     * For every policy except a truncated FireEachMissed batch, the whole ($cursor, now] window
+     * has been settled (fired, or deliberately skipped/collapsed), so the cursor advances to now.
+     * A FireEachMissed batch that hit its cap has UNfired candidates remaining, so the cursor stops
+     * at the last fired slot — the remainder drains on the next tick instead of being abandoned.
      *
-     * Uses DateTimeImmutable constructor (not createFromFormat) because 'c'
-     * is not a reliable format specifier for createFromFormat across PHP versions.
-     * The constructor accepts any ISO 8601 string including '+00:00' offsets.
+     * Never returns a value below $workCursor (guards clock skew / future cursors).
+     *
+     * @param list<ScheduledFire> $candidates
+     * @param list<ScheduledFire> $fires
      */
-    private function parseLastFireTime(?string $slotKey): ?DateTimeImmutable
-    {
-        if ($slotKey === null) {
-            return null;
+    private function computeNewCursor(
+        MisfirePolicy     $policy,
+        array             $candidates,
+        array             $fires,
+        DateTimeImmutable $now,
+        DateTimeImmutable $workCursor,
+    ): DateTimeImmutable {
+        if ($policy instanceof FireEachMissed && count($fires) < count($candidates) && $fires !== []) {
+            $base = end($fires)->scheduledFor;
+        } else {
+            $base = $now;
         }
 
-        // UUID is always 36 characters (8-4-4-4-12 with dashes).
-        if (strlen($slotKey) <= 37) {
-            return null;
-        }
-
-        $dtString = substr($slotKey, 37);
-
-        try {
-            return new DateTimeImmutable($dtString);
-        } catch (\Throwable) {
-            return null;
-        }
+        return $base >= $workCursor ? $base : $workCursor;
     }
 }

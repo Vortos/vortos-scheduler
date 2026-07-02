@@ -29,6 +29,7 @@ use Vortos\Scheduler\Schedule\Trigger\IntervalTrigger;
 use Vortos\Scheduler\Store\PruneResult;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
+use Vortos\Scheduler\Testing\InMemoryScheduleCursorStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStore;
 
 /**
@@ -74,11 +75,12 @@ final class SchedulerSoakTest extends TestCase
             new InMemoryScheduleStatusOverrideStore(),
         );
 
-        $dispatcher = new SoakDispatcher($enqueuer, $runStore, $clock);
-        $daemon     = new SchedulerDaemon(
+        $dispatcher  = new SoakDispatcher($enqueuer, $runStore, $clock);
+        $cursorStore = $this->seededCursorStore($store, $start);
+        $daemon      = new SchedulerDaemon(
             leasePort:                new InMemoryLeaseStore($clock),
             scheduleResolver:         $resolver,
-            runStore:                 $runStore,
+            cursorStore:              $cursorStore,
             dueScan:                  new DueScan(new MisfireResolver(new \Vortos\Scheduler\Engine\SlotCalculator()), 86400),
             fireDispatcher:           $dispatcher,
             clock:                    $clock,
@@ -137,7 +139,7 @@ final class SchedulerSoakTest extends TestCase
         $daemon = new SchedulerDaemon(
             leasePort:                new InMemoryLeaseStore($clock),
             scheduleResolver:         $resolver,
-            runStore:                 $runStore,
+            cursorStore:              $this->seededCursorStore($store, $start),
             dueScan:                  new DueScan(new MisfireResolver(new \Vortos\Scheduler\Engine\SlotCalculator()), 86400),
             fireDispatcher:           $dispatcher,
             clock:                    $clock,
@@ -174,6 +176,21 @@ final class SchedulerSoakTest extends TestCase
             status:   ScheduleStatus::Active,
             tenantId: $tenantId,
         );
+    }
+
+    /**
+     * Seed each active schedule's cadence cursor one interval before $start, so exactly one slot is
+     * due on the first tick. Subsequent ticks advance the clock one interval, keeping one slot due.
+     */
+    private function seededCursorStore(InMemoryScheduleStore $store, DateTimeImmutable $start): InMemoryScheduleCursorStore
+    {
+        $cursorStore = new InMemoryScheduleCursorStore();
+        $seedAt      = $start->modify('-' . self::INTERVAL_SECONDS . ' seconds');
+        foreach ($store->findAllActive() as $s) {
+            $cursorStore->advance($s->id, $s->tenantId, $seedAt, 0);
+        }
+
+        return $cursorStore;
     }
 }
 

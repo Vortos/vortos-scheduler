@@ -159,15 +159,11 @@ final class FireDispatcherIdempotencyTest extends TestCase
         $resolver   = new MisfireResolver($this->slotCalc);
         $scan       = new DueScan($resolver, 86400);
         $now        = new DateTimeImmutable('2026-07-01T11:00:01Z');
-        $lastSlot   = $this->slotCalc->slotKey(
-            $this->schedule->id,
-            new DateTimeImmutable('2026-07-01T10:00:00Z'),
-            $this->schedule->timezone,
-        );
+        $cursor     = new DateTimeImmutable('2026-07-01T10:00:00Z');
 
         $scanResult = $scan->compute(
             [$this->schedule],
-            [$this->schedule->id->toString() => $lastSlot],
+            [$this->schedule->id->toString() => $cursor],
             $now,
         );
 

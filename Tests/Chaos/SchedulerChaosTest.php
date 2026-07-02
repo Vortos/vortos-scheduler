@@ -28,6 +28,7 @@ use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\IntervalTrigger;
 use Vortos\Scheduler\Store\PruneResult;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
+use Vortos\Scheduler\Testing\InMemoryScheduleCursorStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStore;
 use Vortos\Scheduler\Testing\FailingSchedulerEnqueuer;
@@ -185,7 +186,7 @@ final class SchedulerChaosTest extends TestCase
             }
         };
 
-        $daemon = $this->makeDaemon($dispatcher, $runStore);
+        $daemon = $this->makeDaemon($dispatcher);
 
         // Run the same tick twice (simulates a duplicate trigger or process restart)
         $daemon->runOnce();
@@ -251,8 +252,7 @@ final class SchedulerChaosTest extends TestCase
     }
 
     private function makeDaemon(
-        FireDispatcherPort    $dispatcher,
-        ?ScheduleRunStoreInterface $runStore = null,
+        FireDispatcherPort $dispatcher,
     ): SchedulerDaemon {
         $resolver = new ScheduleResolver(
             new StaticScheduleRegistry([]),
@@ -260,10 +260,19 @@ final class SchedulerChaosTest extends TestCase
             new InMemoryScheduleStatusOverrideStore(),
         );
 
+        // Seed each active schedule's cadence cursor one interval (1h) before the clock so exactly
+        // one slot is due — the failure/retry tests then re-fire that slot until it succeeds,
+        // because a failed dispatch blocks the schedule and its cursor does not advance.
+        $cursorStore = new InMemoryScheduleCursorStore();
+        $seedAt      = $this->clock->now()->modify('-3600 seconds');
+        foreach ($this->store->findAllActive() as $s) {
+            $cursorStore->advance($s->id, $s->tenantId, $seedAt, 0);
+        }
+
         return new SchedulerDaemon(
             leasePort:                new InMemoryLeaseStore($this->clock),
             scheduleResolver:         $resolver,
-            runStore:                 $runStore ?? new ChaosRunStore(),
+            cursorStore:              $cursorStore,
             dueScan:                  new DueScan(new MisfireResolver(new \Vortos\Scheduler\Engine\SlotCalculator()), 86400),
             fireDispatcher:           $dispatcher,
             clock:                    $this->clock,

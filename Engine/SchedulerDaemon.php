@@ -19,7 +19,8 @@ use Vortos\Scheduler\Observability\DeadManDetector;
 use Vortos\Scheduler\Observability\SchedulerMetricsPort;
 use Vortos\Scheduler\Registry\ScheduleResolver;
 use Vortos\Scheduler\Schedule\ScheduleId;
-use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
+use Vortos\Scheduler\Store\CadenceCursor;
+use Vortos\Scheduler\Store\ScheduleCursorStoreInterface;
 
 /**
  * Leader-elected distributed scheduler daemon.
@@ -72,7 +73,7 @@ final class SchedulerDaemon
     public function __construct(
         private readonly LeasePort                 $leasePort,
         private readonly ScheduleResolver          $scheduleResolver,
-        private readonly ScheduleRunStoreInterface $runStore,
+        private readonly ScheduleCursorStoreInterface $cursorStore,
         private readonly DueScan                   $dueScan,
         private readonly FireDispatcherPort        $fireDispatcher,
         private readonly ClockPort                 $clock,
@@ -379,13 +380,20 @@ final class SchedulerDaemon
             return null;
         }
 
-        // Single bulk query for all last slots in this shard
-        $lastSlots = $this->runStore->findLastSlots($scheduleIds, null);
+        // Single bulk query for all cadence cursors in this shard. Missing entries mean the
+        // schedule has never been scanned — DueScan anchors those to `now` (no retroactive
+        // catch-up). Cursors are read from the dedicated cursor store, NOT the execution log,
+        // so manual run-now fires never perturb automatic cadence.
+        $cursors           = $this->cursorStore->findCursors($scheduleIds, null);
+        $cursorAtBySchedule = [];
+        foreach ($cursors as $scheduleIdStr => $cursor) {
+            $cursorAtBySchedule[$scheduleIdStr] = $cursor->cursorAt;
+        }
 
         // DueScan receives pre-filtered schedules; shard params omitted (list already filtered)
         $scanResult = $this->dueScan->compute(
             array_values($shardSchedules),
-            $lastSlots,
+            $cursorAtBySchedule,
             $now,
         );
 
@@ -404,6 +412,16 @@ final class SchedulerDaemon
         /** @var array<string, int> $tenantFireCount */
         $tenantFireCount = [];
 
+        // Cadence-cursor bookkeeping (advanced after the dispatch loop). A schedule's cursor may
+        // only advance past slots that were actually settled this tick — a throttled, deferred,
+        // circuit-open or failed slot must be re-evaluated next tick, so it "blocks" its schedule
+        // and the cursor stops at the last contiguous settled slot (or does not move).
+        /** @var array<string, true> $blockedSchedules */
+        $blockedSchedules = [];
+        /** @var array<string, \DateTimeImmutable> $lastSettledFor */
+        $lastSettledFor = [];
+        $dispatchAborted = false;
+
         foreach ($scanResult->fires as $fire) {
             // Per-tenant fairness cap (null tenant maps to empty-string bucket)
             $bucket = $fire->tenantId ?? '';
@@ -419,6 +437,7 @@ final class SchedulerDaemon
                         'cap'         => $this->tenantMaxConcurrentFires,
                     ]);
                     $this->metrics?->recordFairnessThrottle($fire->tenantId);
+                    $blockedSchedules[$fire->scheduleId->toString()] = true;
                     continue;
                 }
             }
@@ -440,6 +459,9 @@ final class SchedulerDaemon
                 $this->logger->warning('Scheduler: heartbeat guard unhealthy — skipping dispatch for shard', [
                     'shard' => $shardIndex,
                 ]);
+                // Abort before advancing any cursor: we may be about to lose the lease, and another
+                // node must see the un-advanced cursors to pick up the un-dispatched slots.
+                $dispatchAborted = true;
                 break;
             }
 
@@ -471,8 +493,26 @@ final class SchedulerDaemon
                 } elseif ($dispatchResult === FireDispatchResult::SkippedOverlap) {
                     $this->audit?->onFireSkippedOverlap($fire, '', 'dispatched');
                 }
+
+                // Settled outcomes let the cursor advance past this slot; Deferred (jitter window
+                // not yet elapsed) and CircuitOpen retry the same slot next tick, so they block.
+                $sid = $fire->scheduleId->toString();
+                $settled = $dispatchResult === FireDispatchResult::Dispatched
+                    || $dispatchResult === FireDispatchResult::AlreadyDispatched
+                    || $dispatchResult === FireDispatchResult::SkippedOverlap;
+
+                if ($settled) {
+                    if (!isset($blockedSchedules[$sid])) {
+                        $lastSettledFor[$sid] = $fire->scheduledFor;
+                    }
+                } else {
+                    $blockedSchedules[$sid] = true;
+                }
             } catch (FireDispatchException $e) {
-                // Per-fire exception — log and continue; systemic failures propagate out
+                // Per-fire exception — log and continue; systemic failures propagate out.
+                // A failed slot is not settled: block its schedule so the cursor does not advance
+                // past it and it is retried next tick.
+                $blockedSchedules[$fire->scheduleId->toString()] = true;
                 $this->logger->error('Scheduler: fire dispatch failed (continuing to next fire)', [
                     'shard'       => $shardIndex,
                     'schedule_id' => $fire->scheduleId->toString(),
@@ -480,6 +520,20 @@ final class SchedulerDaemon
                     'error'       => $e->getMessage(),
                 ]);
             }
+        }
+
+        // Advance cadence cursors for every schedule that was fully settled this tick. Skipped
+        // entirely when dispatch was aborted (heartbeat), so a taking-over node sees un-advanced
+        // cursors. This is what advances the anchor even when a policy fires nothing (SkipMissed).
+        if (!$dispatchAborted) {
+            $this->advanceCursors(
+                $shardSchedules,
+                $scanResult->newCursors,
+                $cursors,
+                $blockedSchedules,
+                $lastSettledFor,
+                $shardIndex,
+            );
         }
 
         $this->metrics?->recordActiveSchedules(count($shardSchedules));
@@ -499,6 +553,57 @@ final class SchedulerDaemon
         }
 
         return $nextDue;
+    }
+
+    /**
+     * CAS-advance each schedule's cadence cursor to the settled high-water mark for this tick.
+     *
+     * A schedule with no due fires (nothing enumerated, or a policy that collapsed the batch such
+     * as SkipMissed) advances to its DueScan-computed cursor — this is what keeps the anchor moving
+     * and prevents the never-advancing deadlock. A schedule that had an unsettled slot advances only
+     * to its last contiguous settled slot (or not at all), so unsettled slots retry next tick.
+     *
+     * @param array<string, \Vortos\Scheduler\Schedule\Schedule> $shardSchedules keyed by scheduleId
+     * @param array<string, \DateTimeImmutable>                  $newCursors     DueScan result
+     * @param array<string, CadenceCursor>                       $currentCursors as read this tick
+     * @param array<string, true>                                $blockedSchedules
+     * @param array<string, \DateTimeImmutable>                  $lastSettledFor
+     */
+    private function advanceCursors(
+        array $shardSchedules,
+        array $newCursors,
+        array $currentCursors,
+        array $blockedSchedules,
+        array $lastSettledFor,
+        int   $shardIndex,
+    ): void {
+        foreach ($shardSchedules as $sid => $schedule) {
+            if (isset($blockedSchedules[$sid])) {
+                $target = $lastSettledFor[$sid] ?? null;
+            } else {
+                $target = $newCursors[$sid] ?? null;
+            }
+
+            if ($target === null) {
+                continue;
+            }
+
+            $expectedVersion = isset($currentCursors[$sid]) ? $currentCursors[$sid]->version : 0;
+
+            $advanced = $this->cursorStore->advance(
+                $schedule->id,
+                $schedule->tenantId,
+                $target,
+                $expectedVersion,
+            );
+
+            if (!$advanced) {
+                $this->logger->info('Scheduler: cadence cursor advance lost race (another node moved it first)', [
+                    'shard'       => $shardIndex,
+                    'schedule_id' => $sid,
+                ]);
+            }
+        }
     }
 
     private function renewBeforeDispatch(int $shardIndex): void
