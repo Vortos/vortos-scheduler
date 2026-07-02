@@ -23,15 +23,12 @@ use Vortos\Scheduler\Audit\SchedulerAuditProjector;
 use Vortos\Scheduler\Audit\SchedulerAuditRepositoryInterface;
 use Vortos\Scheduler\Clock\ClockPort;
 use Vortos\Scheduler\Clock\SystemClock;
-use Vortos\Scheduler\Command\Handler\PruneSchedulerRunsHandler;
 use Vortos\Scheduler\Command\PruneSchedulerRunsCommand;
 use Vortos\Scheduler\Console\RetentionOverrideRemoveCommand;
 use Vortos\Scheduler\Console\RetentionOverrideSetCommand;
-use Vortos\Scheduler\Console\SchedulerConsumeCommand;
 use Vortos\Scheduler\Console\SchedulerRunCommand;
 use Vortos\Scheduler\DependencyInjection\Compiler\LeaseDriverPass;
 use Vortos\Scheduler\Engine\CircuitBreaker\DispatchCircuitBreaker;
-use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
 use Vortos\Scheduler\Engine\DueScan;
 use Vortos\Scheduler\Engine\FireDispatcher;
 use Vortos\Scheduler\Engine\MisfireResolver;
@@ -39,7 +36,6 @@ use Vortos\Scheduler\Engine\Outbox\DbalSchedulerEnqueuer;
 use Vortos\Scheduler\Engine\SchedulerDaemon;
 use Vortos\Scheduler\Engine\SchedulerEnqueuerPort;
 use Vortos\Scheduler\Engine\SlotCalculator;
-use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Lease\Driver\InMemoryLeaseStore;
 use Vortos\Scheduler\Lease\Driver\PostgresAdvisoryLeaseStore;
 use Vortos\Scheduler\Lease\Driver\RedisLeaseStore;
@@ -606,75 +602,33 @@ final class SchedulerExtension extends Extension
         $container->register(PruneSchedulerRunsCommand::class, PruneSchedulerRunsCommand::class)
             ->setPublic(false);
 
-        // Checking interface_exists() alone is not enough: in a monorepo, Cqrs classes
-        // may be autoloadable even when CqrsExtension was never loaded into THIS
-        // container (e.g. a minimal test container) — hasAlias() confirms the service
-        // is actually registered here, matching the existing $policyEngineClass /
-        // $alertsClass gates elsewhere in this file (class_exists AND hasDefinition).
-        $commandBusInterface = 'Vortos\Cqrs\Command\CommandBusInterface';
-
-        if (interface_exists($commandBusInterface) && $container->hasAlias($commandBusInterface)) {
-            $container->register(PruneSchedulerRunsHandler::class, PruneSchedulerRunsHandler::class)
-                ->setArgument('$sweeper', new Reference(RunRetentionSweeper::class))
-                ->addTag('vortos.command_handler')
-                ->setPublic(true);
-        }
+        // The auto-prune schedule is live, so its CQRS command handler must be wired — but only
+        // when the CommandBus is installed. That gate is a cross-package alias check, which is
+        // unreliable during load() under MergeExtensionConfigurationPass isolation (it reads false
+        // even when the bus is present). We flag the schedule as active here and let
+        // {@see ConsumerRegistrationPass} register the handler at build time, where the alias is
+        // visible. Without this seam the handler was silently skipped and the daily prune fire sat
+        // undispatchable in the queue.
+        $container->setParameter('vortos_scheduler.auto_prune_active', true);
     }
 
     /**
-     * S12: fire-queue consumer. Without this, scheduled commands are recorded as
+     * S12: fire-queue consumer. Without a consumer, scheduled commands are recorded as
      * "dispatched" in the ledger but never actually execute — see
-     * SCHEDULER_AUTO_PRUNE_IMPL_PLAN.md "Prerequisite 2". Gated on the CQRS
-     * CommandBus being installed; when it isn't, SchedulerDoctor's C11 reports why.
+     * SCHEDULER_AUTO_PRUNE_IMPL_PLAN.md "Prerequisite 2".
+     *
+     * The consumer depends on the CQRS CommandBus, whose alias is owned by another package and is
+     * NOT visible during load() under MergeExtensionConfigurationPass isolation. A load()-time
+     * hasAlias() check therefore silently skipped the whole consumer even when the bus was
+     * installed. The actual wiring now lives in {@see ConsumerRegistrationPass}, which runs at
+     * build time where the alias is visible. Here we only export the config the pass cannot
+     * otherwise see across the load()/compile() boundary (a container parameter is the standard
+     * seam — same as vortos_scheduler.lease_driver above).
      */
     private function registerConsumer(ContainerBuilder $container, array $config): void
     {
-        $commandBusInterface = 'Vortos\Cqrs\Command\CommandBusInterface';
-
-        if (!class_exists(Connection::class)
-            || !interface_exists($commandBusInterface)
-            || !$container->hasAlias($commandBusInterface)) {
-            return;
-        }
-
-        $prefix = $container->hasParameter('vortos.db.framework_table_prefix')
-            ? (string) $container->getParameter('vortos.db.framework_table_prefix')
-            : 'vortos_';
-
-        $container->register(CommandHydrator::class, CommandHydrator::class)
-            ->setPublic(false);
-
-        $container->register(FireQueueConsumer::class, FireQueueConsumer::class)
-            ->setArgument('$connection', new Reference(Connection::class))
-            ->setArgument('$runStore', new Reference(ScheduleRunStoreInterface::class))
-            ->setArgument('$commandBus', new Reference($commandBusInterface))
-            ->setArgument('$hydrator', new Reference(CommandHydrator::class))
-            ->setArgument('$clock', new Reference(ClockInterface::class))
-            ->setArgument('$tracer', new Reference(SchedulerTracer::class))
-            ->setArgument('$metrics', new Reference(SchedulerMetricsPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
-            ->setArgument('$logger', new Reference(LoggerInterface::class))
-            ->setArgument('$table', $prefix . 'scheduler_fire_queue')
-            ->setPublic(false);
-
-        $container->register(SchedulerConsumeCommand::class, SchedulerConsumeCommand::class)
-            ->setArgument('$consumer', new Reference(FireQueueConsumer::class))
-            ->setArgument('$defaultBatchSize', $config['consume_batch_size'])
-            ->setArgument('$defaultPollIntervalSec', $config['consume_poll_interval_sec'])
-            ->addTag('console.command')
-            ->setPublic(false);
-
-        if (\class_exists(\Vortos\Docker\Worker\WorkerProcessDefinition::class)) {
-            $container->register('vortos_scheduler.worker.consumer', \Vortos\Docker\Worker\WorkerProcessDefinition::class)
-                ->setArguments([
-                    'scheduler-consumer',
-                    'php /var/www/html/bin/console scheduler:consume --loop',
-                    'Vortos Scheduler: fire-queue consumer (drains scheduled commands into the CQRS bus).',
-                    true,  // autostart
-                    true,  // autorestart
-                ])
-                ->addTag('vortos.worker')
-                ->setPublic(false);
-        }
+        $container->setParameter('vortos_scheduler.consume_batch_size', $config['consume_batch_size']);
+        $container->setParameter('vortos_scheduler.consume_poll_interval_sec', $config['consume_poll_interval_sec']);
     }
 
     private function registerService(ContainerBuilder $container): void
@@ -733,9 +687,10 @@ final class SchedulerExtension extends Extension
             ->setArgument('$maxCatchupAgeSec', $config['max_catchup_age_sec'])
             ->setArgument('$runRetentionDays', $config['run_retention_days'])
             ->setArgument('$retentionOverrideStore', new Reference(RunRetentionOverrideStoreInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
-            // Reflects whether registerConsumer() actually wired the consumer in THIS
-            // container, not just whether Cqrs classes happen to be autoloadable.
-            ->setArgument('$fireQueueConsumerInstalled', $container->hasDefinition(FireQueueConsumer::class))
+            // Default false: the fire-queue consumer is wired at build time by
+            // ConsumerRegistrationPass (the CommandBus alias it gates on is not visible during
+            // load()), which flips this argument to true when it actually registers the consumer.
+            ->setArgument('$fireQueueConsumerInstalled', false)
             ->setArgument('$consumeStallThresholdSec', $config['consume_stall_threshold_sec'])
             ->setPublic(false);
 
