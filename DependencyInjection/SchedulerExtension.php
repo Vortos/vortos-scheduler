@@ -38,6 +38,7 @@ use Vortos\Scheduler\Engine\MisfireResolver;
 use Vortos\Scheduler\Engine\Outbox\DbalSchedulerEnqueuer;
 use Vortos\Scheduler\Engine\SchedulerDaemon;
 use Vortos\Scheduler\Engine\SchedulerEnqueuerPort;
+use Vortos\Scheduler\Engine\SlotCalculator;
 use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Lease\Driver\InMemoryLeaseStore;
 use Vortos\Scheduler\Lease\Driver\PostgresAdvisoryLeaseStore;
@@ -229,7 +230,11 @@ final class SchedulerExtension extends Extension
     private function registerEngine(ContainerBuilder $container, array $config): void
     {
         // Pure engine components — no infrastructure dependencies
+        $container->register(SlotCalculator::class, SlotCalculator::class)
+            ->setPublic(false);
+
         $container->register(MisfireResolver::class, MisfireResolver::class)
+            ->setArgument('$slotCalculator', new Reference(SlotCalculator::class))
             ->setPublic(false);
 
         $container->register(DueScan::class, DueScan::class)
@@ -734,11 +739,17 @@ final class SchedulerExtension extends Extension
             ->setArgument('$consumeStallThresholdSec', $config['consume_stall_threshold_sec'])
             ->setPublic(false);
 
-        // D: deploy:doctor gate — only registered when vortos-deploy is installed.
+        // D: deploy:doctor gate — only registered when vortos-deploy is installed. The
+        // interface_exists() guard keeps the scheduler fully decoupled from vortos-deploy when
+        // it is absent (autoloader-based, order-free). When deploy IS present we let its
+        // registerForAutoconfiguration(PreflightCheckInterface) apply the correct collection
+        // tag via setAutoconfigured(true) — hand-tagging previously used the wrong tag name
+        // ('vortos.preflight_check' vs deploy's 'vortos.deploy.preflight_check'), so the gate
+        // was registered but never collected by DeployDoctor.
         if (\interface_exists(\Vortos\Deploy\Preflight\PreflightCheckInterface::class)) {
             $container->register(SchedulerPreflightCheck::class, SchedulerPreflightCheck::class)
                 ->setArgument('$doctor', new Reference(SchedulerDoctor::class))
-                ->addTag('vortos.preflight_check')
+                ->setAutoconfigured(true)
                 ->setPublic(false);
         }
     }
