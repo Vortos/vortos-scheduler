@@ -42,7 +42,13 @@ final class FireQueueConsumer
     public function __construct(
         private readonly Connection                 $connection,
         private readonly ScheduleRunStoreInterface  $runStore,
-        private readonly CommandBusInterface        $commandBus,
+        // Nullable, and injected with NULL_ON_INVALID_REFERENCE: the CQRS CommandBus is an
+        // optional dependency (vortos-cqrs is not a hard require of the scheduler) and its alias
+        // may be unwired in a minimal container. The consumer is registered unconditionally so
+        // that scheduler:consume always exists — the absence of a bus is reported as a loud,
+        // specific runtime error (see consumeBatch) rather than the whole command silently
+        // vanishing from the container.
+        private readonly ?CommandBusInterface       $commandBus,
         private readonly CommandHydrator            $hydrator,
         private readonly ClockInterface             $clock,
         private readonly SchedulerTracer            $tracer,
@@ -57,6 +63,17 @@ final class FireQueueConsumer
      */
     public function consumeBatch(int $batchSize): int
     {
+        // Fail loud and BEFORE claiming any rows — a null bus means nothing can be dispatched, so
+        // claiming would strand rows in 'processing'. This surfaces the misconfiguration the
+        // instant scheduler:consume runs, instead of silently draining fires into a void.
+        if ($this->commandBus === null) {
+            throw new \RuntimeException(
+                'Cannot consume the scheduler fire queue: no CQRS CommandBus is wired. Install '
+                . 'vortos-cqrs and ensure its CommandBusInterface alias is registered in this '
+                . 'container before running scheduler:consume.',
+            );
+        }
+
         $rows = $this->claimBatch($batchSize);
 
         foreach ($rows as $row) {

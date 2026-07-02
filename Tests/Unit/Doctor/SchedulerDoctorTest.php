@@ -87,7 +87,7 @@ final class SchedulerDoctorTest extends TestCase
         int $maxCatchupAgeSec = 86400,
         int $runRetentionDays = 0,
         \Vortos\Scheduler\Store\RunRetentionOverrideStoreInterface $retentionOverrideStore = null,
-        bool $fireQueueConsumerInstalled = false,
+        ?object $commandBus = null,
         int $consumeStallThresholdSec = 120,
     ): SchedulerDoctor {
         $reg      = $registry ?? new StaticScheduleRegistry([]);
@@ -108,7 +108,7 @@ final class SchedulerDoctorTest extends TestCase
             maxCatchupAgeSec:            $maxCatchupAgeSec,
             runRetentionDays:            $runRetentionDays,
             retentionOverrideStore:     $retentionOverrideStore,
-            fireQueueConsumerInstalled: $fireQueueConsumerInstalled,
+            commandBus:                 $commandBus,
             consumeStallThresholdSec:   $consumeStallThresholdSec,
         );
     }
@@ -577,7 +577,7 @@ final class SchedulerDoctorTest extends TestCase
 
     public function test_c11_skips_when_consumer_not_installed(): void
     {
-        $report = $this->makeDoctor(fireQueueConsumerInstalled: false)->run();
+        $report = $this->makeDoctor(commandBus: null)->run();
         $c11 = $this->findCheck($report->findings, 'C11');
         self::assertSame(SchedulerDoctorStatus::Skip, $c11->status);
     }
@@ -587,7 +587,7 @@ final class SchedulerDoctorTest extends TestCase
         $conn = $this->makeSqliteConnection();
         $this->makeRunsAndQueueTables($conn);
 
-        $report = $this->makeDoctor(conn: $conn, fireQueueConsumerInstalled: true)->run();
+        $report = $this->makeDoctor(conn: $conn, commandBus: new \stdClass())->run();
         $c11 = $this->findCheck($report->findings, 'C11');
         self::assertSame(SchedulerDoctorStatus::Pass, $c11->status);
     }
@@ -602,7 +602,7 @@ final class SchedulerDoctorTest extends TestCase
             'created_at' => $this->clock->now()->modify('-5 seconds')->format('Y-m-d H:i:s'),
         ]);
 
-        $report = $this->makeDoctor(conn: $conn, fireQueueConsumerInstalled: true, consumeStallThresholdSec: 120)->run();
+        $report = $this->makeDoctor(conn: $conn, commandBus: new \stdClass(), consumeStallThresholdSec: 120)->run();
         $c11 = $this->findCheck($report->findings, 'C11');
         self::assertSame(SchedulerDoctorStatus::Pass, $c11->status);
     }
@@ -617,7 +617,7 @@ final class SchedulerDoctorTest extends TestCase
             'created_at' => $this->clock->now()->modify('-1 hour')->format('Y-m-d H:i:s'),
         ]);
 
-        $report = $this->makeDoctor(conn: $conn, fireQueueConsumerInstalled: true, consumeStallThresholdSec: 120)->run();
+        $report = $this->makeDoctor(conn: $conn, commandBus: new \stdClass(), consumeStallThresholdSec: 120)->run();
         $c11 = $this->findCheck($report->findings, 'C11');
         self::assertSame(SchedulerDoctorStatus::Fail, $c11->status);
         self::assertStringContainsString('scheduler:consume', $c11->remediation);

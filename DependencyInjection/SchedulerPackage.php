@@ -8,7 +8,6 @@ use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Extension\ExtensionInterface;
 use Vortos\Foundation\Contract\PackageInterface;
-use Vortos\Scheduler\DependencyInjection\Compiler\ConsumerRegistrationPass;
 use Vortos\Scheduler\DependencyInjection\Compiler\LeaseDriverPass;
 use Vortos\Scheduler\DependencyInjection\Compiler\SchedulableCommandPass;
 use Vortos\Scheduler\DependencyInjection\Compiler\StaticSchedulePass;
@@ -40,15 +39,6 @@ final class SchedulerPackage implements PackageInterface
             new SchedulableCommandPass(),
             PassConfig::TYPE_BEFORE_OPTIMIZATION,
             -30,
-        );
-        // ConsumerRegistrationPass wires the CQRS-CommandBus-dependent services (fire-queue
-        // consumer + auto-prune handler) at build time, where the cross-package CommandBus alias
-        // is finally visible. Priority 60 beats Cqrs CommandHandlerPass (50) and Foundation
-        // ConsoleCommandPass (0), whose collectors must see the services this pass registers.
-        $container->addCompilerPass(
-            new ConsumerRegistrationPass(),
-            PassConfig::TYPE_BEFORE_OPTIMIZATION,
-            60,
         );
     }
 }

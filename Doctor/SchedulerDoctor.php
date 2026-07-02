@@ -56,7 +56,10 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         // so it never assumes a `scheduler_runs` schema it wasn't given.
         private readonly int                               $runRetentionDays = 0,
         private readonly ?RunRetentionOverrideStoreInterface $retentionOverrideStore = null,
-        private readonly bool                              $fireQueueConsumerInstalled = false,
+        // The CQRS CommandBus (optional dependency), injected with NULL_ON_INVALID_REFERENCE.
+        // Null ⇒ no bus is wired ⇒ the fire-queue consumer cannot dispatch, so C11 skips. Typed
+        // ?object to avoid a hard compile-time coupling to vortos-cqrs (which may be absent).
+        private readonly ?object                          $commandBus = null,
         private readonly int                               $consumeStallThresholdSec = 120,
     ) {}
 
@@ -595,11 +598,11 @@ final class SchedulerDoctor implements SchedulerDoctorPort
 
     private function checkFireQueueConsumerHealthy(DateTimeImmutable $now): SchedulerDoctorFinding
     {
-        if (!$this->fireQueueConsumerInstalled) {
+        if ($this->commandBus === null) {
             return new SchedulerDoctorFinding(
                 'C11',
                 SchedulerDoctorStatus::Skip,
-                'CQRS CommandBus not installed — fire-queue consumer check skipped.',
+                'CQRS CommandBus not wired — fire-queue consumer cannot dispatch; check skipped.',
             );
         }
 

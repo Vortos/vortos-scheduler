@@ -59,6 +59,36 @@ final class FireQueueConsumerTest extends TestCase
         self::assertSame(0, $this->makeConsumer()->consumeBatch(10));
     }
 
+    public function test_null_command_bus_throws_before_claiming_any_row(): void
+    {
+        $this->insertRow('run-1', FixtureConsumeCommand::class);
+
+        $consumer = new FireQueueConsumer(
+            connection: $this->connection,
+            runStore:   $this->runStore,
+            commandBus: null,
+            hydrator:   new CommandHydrator(),
+            clock:      new MutableClock(new DateTimeImmutable('2026-07-01T10:05:00Z')),
+            tracer:     new SchedulerTracer(null),
+            logger:     new NullLogger(),
+            table:      self::TABLE,
+        );
+
+        try {
+            $consumer->consumeBatch(10);
+            self::fail('Expected a RuntimeException when no CommandBus is wired.');
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('no CQRS CommandBus is wired', $e->getMessage());
+        }
+
+        // The pending row must be untouched — the guard fires before any claim, so nothing is
+        // stranded in 'processing'.
+        $status = $this->connection->fetchOne(
+            'SELECT status FROM ' . self::TABLE . " WHERE run_id = 'run-1'",
+        );
+        self::assertSame('pending', $status);
+    }
+
     public function test_successful_row_dispatches_and_marks_completed(): void
     {
         $this->insertRow('run-1', FixtureConsumeCommand::class);
