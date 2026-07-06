@@ -128,6 +128,8 @@ final class SchedulerBenchmark
             public function recordFairnessThrottle(?string $tenantId): void {}
             public function recordAuditFailure(string $eventType): void {}
             public function recordConsumeResult(bool $success, string $scheduleId, ?string $tenantId): void {}
+            public function recordFireRequeued(string $reason, string $scheduleId, ?string $tenantId): void {}
+            public function recordFireDeadLettered(string $reason, string $scheduleId, ?string $tenantId): void {}
             public function recordRunsPruned(int $count, ?string $tenantId): void {}
             public function recordFireQueuePruned(int $count): void {}
             public function recordPruneDuration(float $seconds, string $trigger): void {}

@@ -37,6 +37,16 @@ interface SchedulerMetricsPort
     /** S12 — result of executing one fire-queue row through the CQRS CommandBus. */
     public function recordConsumeResult(bool $success, string $scheduleId, ?string $tenantId): void;
 
+    /**
+     * R7-4 — a fire-queue row was requeued (not failed) because the consumer could not run the
+     * command class (unknown / not in this node's capability set). $reason is a low-cardinality
+     * label, e.g. 'unknown_class' or 'not_capable'.
+     */
+    public function recordFireRequeued(string $reason, string $scheduleId, ?string $tenantId): void;
+
+    /** R7-4 — a fire-queue row was dead-lettered after exhausting max_attempts requeues. */
+    public function recordFireDeadLettered(string $reason, string $scheduleId, ?string $tenantId): void;
+
     /** Rows deleted by one pruneOldRuns() call (auto or manual). */
     public function recordRunsPruned(int $count, ?string $tenantId): void;
 

@@ -21,33 +21,36 @@ use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
  * command_payload) through the CQRS CommandBus and transitioning the fire-ledger
  * row accordingly.
  *
- * This is the piece that was missing end to end: FireDispatcher (S4) only ever
- * writes intent to this table; nothing previously read it back out, so no
- * scheduled command — static or dynamic — actually ran. See
- * SCHEDULER_AUTO_PRUNE_IMPL_PLAN.md, "Prerequisite 2 — Fire Queue Consumer (S12)"
- * for the full trace.
- *
  * Claim strategy is portable across Postgres and SQLite:
  *  - Postgres: SELECT ... FOR UPDATE SKIP LOCKED inside a short transaction, so
  *    more than one consumer process can run concurrently without double-claiming
- *    a row (same reasoning PostgresAdvisoryLeaseStore already relies on).
- *  - SQLite: plain UPDATE ... WHERE id IN (subquery) — single-writer, no lock
- *    contention to guard against.
+ *    a row.
+ *  - SQLite: plain UPDATE ... WHERE id IN (subquery) — single-writer.
  *
- * One row's failure never blocks the batch: each row is processed and committed
- * independently, inside its own try/catch.
+ * ## R7-4 / SCHED-1 — capability-aware claim + requeue safety net
+ *
+ * A blue/green (heterogeneous-image) fleet runs consumers with DIFFERENT command sets. Previously
+ * ANY running consumer drained the single shared queue, so a stale standby could grab a fire for a
+ * newly-added command class its image lacks and hard-`failed` it. Two defences:
+ *
+ *  1. **Capability-aware claim.** When a capability resolver reports the classes this node can run,
+ *     the claim query only selects fires whose `command_class` is in that set — a stale consumer
+ *     structurally cannot claim a fire it can't run; it is left (SKIP LOCKED) for a capable node.
+ *  2. **Requeue safety net.** If an unrunnable class is somehow claimed anyway (no allowlist
+ *     configured, or the class was removed between claim and dispatch), the row is REQUEUED with a
+ *     visibility-timeout backoff and a bounded attempt counter — never hard-failed — and only
+ *     dead-lettered after `maxAttempts`. A genuine command failure (class present and capable, but
+ *     the handler/payload throws) stays terminal `failed` as before: retrying a poison pill is
+ *     pointless because a capable consumer would fail identically.
  */
 final class FireQueueConsumer
 {
     public function __construct(
         private readonly Connection                 $connection,
         private readonly ScheduleRunStoreInterface  $runStore,
-        // Nullable, and injected with NULL_ON_INVALID_REFERENCE: the CQRS CommandBus is an
-        // optional dependency (vortos-cqrs is not a hard require of the scheduler) and its alias
-        // may be unwired in a minimal container. The consumer is registered unconditionally so
-        // that scheduler:consume always exists — the absence of a bus is reported as a loud,
-        // specific runtime error (see consumeBatch) rather than the whole command silently
-        // vanishing from the container.
+        // Nullable, injected with NULL_ON_INVALID_REFERENCE: the CQRS CommandBus is optional and
+        // its alias may be unwired in a minimal container. A null bus is a loud runtime error (see
+        // consumeBatch), never a silently-vanishing command.
         private readonly ?CommandBusInterface       $commandBus,
         private readonly CommandHydrator            $hydrator,
         private readonly ClockInterface             $clock,
@@ -55,17 +58,21 @@ final class FireQueueConsumer
         private readonly ?SchedulerMetricsPort      $metrics = null,
         private readonly LoggerInterface            $logger = new NullLogger(),
         private readonly string                     $table = 'vortos_scheduler_fire_queue',
+        // R7-4: null resolver ⇒ no capability filter (claim-all); the requeue net still applies.
+        private readonly ?ConsumerCapabilityResolverInterface $capabilityResolver = null,
+        private readonly int                        $maxAttempts = 10,
+        private readonly int                        $backoffBaseSec = 2,
+        private readonly int                        $backoffCapSec = 300,
     ) {}
 
     /**
      * Claim and process up to $batchSize pending rows. Returns the number processed
-     * (successes + failures — both count as "processed", since both terminate the row).
+     * (successes + terminal failures + requeues — every row that was claimed).
      */
     public function consumeBatch(int $batchSize): int
     {
-        // Fail loud and BEFORE claiming any rows — a null bus means nothing can be dispatched, so
-        // claiming would strand rows in 'processing'. This surfaces the misconfiguration the
-        // instant scheduler:consume runs, instead of silently draining fires into a void.
+        // Fail loud BEFORE claiming — a null bus means nothing can be dispatched, so claiming would
+        // strand rows in 'processing'.
         if ($this->commandBus === null) {
             throw new \RuntimeException(
                 'Cannot consume the scheduler fire queue: no CQRS CommandBus is wired. Install '
@@ -74,25 +81,34 @@ final class FireQueueConsumer
             );
         }
 
-        $rows = $this->claimBatch($batchSize);
+        $capabilities = $this->capabilityResolver?->capableCommandClasses();
+
+        // A resolver that reports an empty capability set means this node can run nothing — claim
+        // nothing rather than issue an `IN ()` that some drivers reject.
+        if ($capabilities !== null && $capabilities === []) {
+            return 0;
+        }
+
+        $rows = $this->claimBatch($batchSize, $capabilities);
 
         foreach ($rows as $row) {
-            $this->processRow($row);
+            $this->processRow($row, $capabilities);
         }
 
         return count($rows);
     }
 
-    /** @return list<array<string, mixed>> */
-    private function claimBatch(int $batchSize): array
+    /**
+     * @param list<string>|null $capabilities
+     * @return list<array<string, mixed>>
+     */
+    private function claimBatch(int $batchSize, ?array $capabilities): array
     {
         $isPostgres = $this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform;
 
-        if ($isPostgres) {
-            $ids = $this->claimBatchPostgres($batchSize);
-        } else {
-            $ids = $this->claimBatchPortable($batchSize);
-        }
+        $ids = $isPostgres
+            ? $this->claimBatchPostgres($batchSize, $capabilities)
+            : $this->claimBatchPortable($batchSize, $capabilities);
 
         if ($ids === []) {
             return [];
@@ -106,19 +122,49 @@ final class FireQueueConsumer
         );
     }
 
-    /** @return list<string> */
-    private function claimBatchPostgres(int $batchSize): array
+    /**
+     * Visible-pending predicate + optional capability filter, shared by both claim paths.
+     *
+     * @param list<string>|null $capabilities
+     * @return array{0: string, 1: list<mixed>} [whereClause, bindings]
+     */
+    private function claimPredicate(?array $capabilities): array
+    {
+        $now = $this->clock->now()->format('Y-m-d H:i:s');
+
+        // available_at gates the visibility timeout: a requeued row is invisible until its backoff
+        // elapses. NULL available_at (never requeued) is always visible.
+        $where = "status = 'pending' AND (available_at IS NULL OR available_at <= ?)";
+        $bindings = [$now];
+
+        if ($capabilities !== null) {
+            $placeholders = implode(',', array_fill(0, count($capabilities), '?'));
+            $where .= " AND command_class IN ({$placeholders})";
+            $bindings = array_merge($bindings, $capabilities);
+        }
+
+        return [$where, $bindings];
+    }
+
+    /**
+     * @param list<string>|null $capabilities
+     * @return list<string>
+     */
+    private function claimBatchPostgres(int $batchSize, ?array $capabilities): array
     {
         $limit = max(0, (int) $batchSize);
+        [$where, $bindings] = $this->claimPredicate($capabilities);
+
         $this->connection->beginTransaction();
 
         try {
             $ids = $this->connection->fetchFirstColumn(
                 "SELECT id FROM {$this->table}
-                 WHERE status = 'pending'
+                 WHERE {$where}
                  ORDER BY created_at ASC
                  LIMIT {$limit}
                  FOR UPDATE SKIP LOCKED",
+                $bindings,
             );
 
             if ($ids !== []) {
@@ -139,15 +185,21 @@ final class FireQueueConsumer
         }
     }
 
-    /** @return list<string> */
-    private function claimBatchPortable(int $batchSize): array
+    /**
+     * @param list<string>|null $capabilities
+     * @return list<string>
+     */
+    private function claimBatchPortable(int $batchSize, ?array $capabilities): array
     {
         $limit = max(0, (int) $batchSize);
-        $ids   = $this->connection->fetchFirstColumn(
+        [$where, $bindings] = $this->claimPredicate($capabilities);
+
+        $ids = $this->connection->fetchFirstColumn(
             "SELECT id FROM {$this->table}
-             WHERE status = 'pending'
+             WHERE {$where}
              ORDER BY created_at ASC
              LIMIT {$limit}",
+            $bindings,
         );
 
         if ($ids === []) {
@@ -163,8 +215,11 @@ final class FireQueueConsumer
         return $ids;
     }
 
-    /** @param array<string, mixed> $row */
-    private function processRow(array $row): void
+    /**
+     * @param array<string, mixed> $row
+     * @param list<string>|null $capabilities
+     */
+    private function processRow(array $row, ?array $capabilities): void
     {
         $rowId        = (string) $row['id'];
         $runId        = (string) $row['run_id'];
@@ -174,7 +229,16 @@ final class FireQueueConsumer
             : null;
         $slot         = (string) $row['slot'];
         $commandClass = (string) $row['command_class'];
+        $attempts     = (int) ($row['attempts'] ?? 0);
         $now          = $this->clock->now();
+
+        // Belt-and-suspenders: even though the claim filtered by capability, re-check at dispatch
+        // time (the class may have been removed since claim, or the node runs with no allowlist).
+        $incapableReason = $this->incapableReason($commandClass, $capabilities);
+        if ($incapableReason !== null) {
+            $this->requeueOrDeadLetter($rowId, $runId, $scheduleId, $tenantId, $commandClass, $attempts, $incapableReason, $now);
+            return;
+        }
 
         try {
             $payload = json_decode((string) $row['command_payload'], true, 512, \JSON_THROW_ON_ERROR);
@@ -199,13 +263,116 @@ final class FireQueueConsumer
             try {
                 $this->runStore->transitionRunState($runId, RunState::Failed, $now);
             } catch (\Throwable) {
-                // Already terminal (e.g. a concurrent retry got there first) — do not
-                // mask the original failure below with a state-transition error.
+                // Already terminal — do not mask the original failure.
             }
 
             $this->markRow($rowId, 'failed', $now, substr($e->getMessage(), 0, 2000));
             $this->metrics?->recordConsumeResult(false, $scheduleId, $tenantId);
         }
+    }
+
+    /**
+     * Why this node cannot run the command, or null if it can.
+     *
+     * @param list<string>|null $capabilities
+     */
+    private function incapableReason(string $commandClass, ?array $capabilities): ?string
+    {
+        if (!class_exists($commandClass)) {
+            return 'unknown_class';
+        }
+
+        if ($capabilities !== null && !in_array($commandClass, $capabilities, true)) {
+            return 'not_capable';
+        }
+
+        return null;
+    }
+
+    /**
+     * Requeue an unrunnable fire with backoff, or dead-letter it once attempts are exhausted. The
+     * run-ledger row is NOT transitioned to Failed on a requeue — a capable consumer will complete
+     * it; only a dead-letter is terminal.
+     */
+    private function requeueOrDeadLetter(
+        string $rowId,
+        string $runId,
+        string $scheduleId,
+        ?string $tenantId,
+        string $commandClass,
+        int $attempts,
+        string $reason,
+        \DateTimeImmutable $now,
+    ): void {
+        $nextAttempts = $attempts + 1;
+
+        if ($nextAttempts >= $this->maxAttempts) {
+            $this->logger->error('Scheduler fire dead-lettered: no capable consumer', [
+                'run_id'        => $runId,
+                'schedule_id'   => $scheduleId,
+                'command_class' => $commandClass,
+                'reason'        => $reason,
+                'attempts'      => $nextAttempts,
+            ]);
+
+            try {
+                $this->runStore->transitionRunState($runId, RunState::Failed, $now);
+            } catch (\Throwable) {
+            }
+
+            $this->connection->executeStatement(
+                "UPDATE {$this->table}
+                 SET status = 'dead_letter', attempts = ?, dispatched_at = ?, failure_reason = ?, last_error = ?
+                 WHERE id = ?",
+                [
+                    $nextAttempts,
+                    $now->format('Y-m-d H:i:s'),
+                    sprintf('dead-lettered after %d attempts (%s): %s', $nextAttempts, $reason, $commandClass),
+                    $reason,
+                    $rowId,
+                ],
+            );
+
+            $this->metrics?->recordFireDeadLettered($reason, $scheduleId, $tenantId);
+
+            return;
+        }
+
+        $availableAt = $now->modify(sprintf('+%d seconds', $this->backoffSeconds($nextAttempts)));
+
+        $this->logger->warning('Scheduler fire requeued for a capable consumer', [
+            'run_id'        => $runId,
+            'schedule_id'   => $scheduleId,
+            'command_class' => $commandClass,
+            'reason'        => $reason,
+            'attempts'      => $nextAttempts,
+            'available_at'  => $availableAt->format('Y-m-d H:i:s'),
+        ]);
+
+        $this->connection->executeStatement(
+            "UPDATE {$this->table}
+             SET status = 'pending', attempts = ?, available_at = ?, last_error = ?, dispatched_at = NULL
+             WHERE id = ?",
+            [
+                $nextAttempts,
+                $availableAt->format('Y-m-d H:i:s'),
+                sprintf('%s: %s', $reason, $commandClass),
+                $rowId,
+            ],
+        );
+
+        $this->metrics?->recordFireRequeued($reason, $scheduleId, $tenantId);
+    }
+
+    /** Exponential backoff with jitter, capped. */
+    private function backoffSeconds(int $attempts): int
+    {
+        $base = (int) min($this->backoffCapSec, $this->backoffBaseSec ** min($attempts, 16));
+        $base = max(1, $base);
+        // Small deterministic-enough jitter (0..25% of base) to avoid a thundering herd of retries.
+        $jitter = random_int(0, (int) max(1, $base / 4));
+
+        return min($this->backoffCapSec, $base + $jitter);
     }
 
     private function markRow(string $rowId, string $status, \DateTimeImmutable $at, ?string $failureReason): void

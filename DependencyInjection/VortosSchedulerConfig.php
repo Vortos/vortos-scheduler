@@ -54,6 +54,9 @@ final class VortosSchedulerConfig
     private int $consumeStallThresholdSec;
     private int $consumeBatchSize;
     private int $consumePollIntervalSec;
+    private int $fireMaxAttempts;
+    private int $fireBackoffBaseSec;
+    private int $fireBackoffCapSec;
     private string $leaseDriver;
 
     public function __construct()
@@ -80,6 +83,9 @@ final class VortosSchedulerConfig
         $this->consumeStallThresholdSec        = \max(1, (int) ($_ENV['SCHEDULER_CONSUME_STALL_THRESHOLD_SEC'] ?? 120));
         $this->consumeBatchSize                = \max(1, (int) ($_ENV['SCHEDULER_CONSUME_BATCH_SIZE'] ?? 50));
         $this->consumePollIntervalSec           = \max(1, (int) ($_ENV['SCHEDULER_CONSUME_POLL_INTERVAL_SEC'] ?? 2));
+        $this->fireMaxAttempts                  = \max(1, (int) ($_ENV['SCHEDULER_FIRE_MAX_ATTEMPTS'] ?? 10));
+        $this->fireBackoffBaseSec               = \max(1, (int) ($_ENV['SCHEDULER_FIRE_BACKOFF_BASE_SEC'] ?? 2));
+        $this->fireBackoffCapSec                = \max(1, (int) ($_ENV['SCHEDULER_FIRE_BACKOFF_CAP_SEC'] ?? 300));
         $this->leaseDriver                     = (string) ($_ENV['VORTOS_SCHEDULER_LEASE_DRIVER'] ?? 'sql');
     }
 
@@ -278,6 +284,9 @@ final class VortosSchedulerConfig
             'consume_stall_threshold_sec'           => $this->consumeStallThresholdSec,
             'consume_batch_size'                    => $this->consumeBatchSize,
             'consume_poll_interval_sec'             => $this->consumePollIntervalSec,
+            'fire_max_attempts'                     => $this->fireMaxAttempts,
+            'fire_backoff_base_sec'                 => $this->fireBackoffBaseSec,
+            'fire_backoff_cap_sec'                  => $this->fireBackoffCapSec,
             'lease_driver'                          => $this->leaseDriver,
         ];
     }

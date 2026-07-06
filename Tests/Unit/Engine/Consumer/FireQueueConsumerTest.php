@@ -12,6 +12,7 @@ use Psr\Log\NullLogger;
 use Vortos\Cqrs\Command\CommandBusInterface;
 use Vortos\Domain\Command\CommandInterface;
 use Vortos\Scheduler\Clock\MutableClock;
+use Vortos\Scheduler\Engine\Consumer\ConsumerCapabilityResolverInterface;
 use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
 use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Fire\RunState;
@@ -46,7 +47,10 @@ final class FireQueueConsumerTest extends TestCase
                 status TEXT NOT NULL DEFAULT "pending",
                 created_at DATETIME NOT NULL,
                 dispatched_at DATETIME NULL,
-                failure_reason TEXT NULL
+                failure_reason TEXT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at DATETIME NULL,
+                last_error TEXT NULL
             )
         ');
 
@@ -156,6 +160,102 @@ final class FireQueueConsumerTest extends TestCase
         self::assertSame(1, $pending);
     }
 
+    public function test_capability_filter_leaves_incapable_fires_for_a_capable_consumer(): void
+    {
+        // R7-4 / SCHED-1: node capable of only FixtureConsumeCommand must claim its fire and leave
+        // the RunDatabaseBackup fire untouched for a node that has that class.
+        $this->insertRow('run-known', FixtureConsumeCommand::class);
+        $this->insertRow('run-foreign', 'App\\Shared\\RunDatabaseBackup');
+
+        $resolver = new FakeCapabilityResolver([FixtureConsumeCommand::class]);
+        $processed = $this->makeConsumer($resolver)->consumeBatch(10);
+
+        self::assertSame(1, $processed, 'Only the capable fire should be claimed.');
+        self::assertSame('dispatched', $this->statusOf('run-known'));
+        self::assertSame('pending', $this->statusOf('run-foreign'), 'The foreign fire must be left pending.');
+        self::assertSame(0, (int) $this->columnOf('run-foreign', 'attempts'), 'Unclaimed fire is not counted as an attempt.');
+    }
+
+    public function test_unknown_class_is_requeued_not_failed(): void
+    {
+        // No capability filter (null resolver) so the row IS claimed, then the requeue net kicks in
+        // because the class does not exist.
+        $this->insertRow('run-x', 'App\\Does\\Not\\Exist');
+
+        $processed = $this->makeConsumer()->consumeBatch(10);
+
+        self::assertSame(1, $processed);
+        self::assertSame('pending', $this->statusOf('run-x'), 'Unknown class must requeue, not fail.');
+        self::assertSame(1, (int) $this->columnOf('run-x', 'attempts'));
+        self::assertNotNull($this->columnOf('run-x', 'available_at'));
+        self::assertArrayNotHasKey('run-x', $this->runStore->transitions, 'Requeue must not fail the run ledger.');
+    }
+
+    public function test_requeued_row_is_invisible_until_available_at(): void
+    {
+        $this->insertRow('run-x', 'App\\Does\\Not\\Exist');
+
+        $this->makeConsumer()->consumeBatch(10); // first attempt → requeued with future available_at
+
+        // A second consume at the SAME clock time must not re-claim the backed-off row.
+        $processed = $this->makeConsumer()->consumeBatch(10);
+        self::assertSame(0, $processed, 'Backed-off row must be invisible until available_at passes.');
+    }
+
+    public function test_dead_letters_after_max_attempts(): void
+    {
+        $this->insertRow('run-x', 'App\\Does\\Not\\Exist');
+        // Pre-age the row to the last attempt so one more requeue crosses the cap.
+        $this->connection->update(self::TABLE, ['attempts' => 2], ['run_id' => 'run-x']);
+
+        // maxAttempts=3 → attempts becomes 3 which is >= 3 → dead_letter.
+        $consumer = $this->makeConsumer(null, maxAttempts: 3);
+        $consumer->consumeBatch(10);
+
+        self::assertSame('dead_letter', $this->statusOf('run-x'));
+        self::assertSame(['run-x' => RunState::Failed], $this->runStore->transitions);
+    }
+
+    public function test_genuine_command_failure_stays_terminal(): void
+    {
+        // Class exists and is capable, but the handler throws → terminal failed, not requeued.
+        $this->insertRow('run-boom', FixtureConsumeCommand::class);
+        $this->commandBus->throwFor(FixtureConsumeCommand::class, new \RuntimeException('handler exploded'));
+
+        $this->makeConsumer()->consumeBatch(10);
+
+        self::assertSame('failed', $this->statusOf('run-boom'));
+        self::assertSame(['run-boom' => RunState::Failed], $this->runStore->transitions);
+        self::assertSame(0, (int) $this->columnOf('run-boom', 'attempts'), 'A poison pill is not requeued.');
+    }
+
+    public function test_empty_capability_set_claims_nothing(): void
+    {
+        $this->insertRow('run-known', FixtureConsumeCommand::class);
+
+        $resolver = new FakeCapabilityResolver([]); // capable of nothing
+        $processed = $this->makeConsumer($resolver)->consumeBatch(10);
+
+        self::assertSame(0, $processed);
+        self::assertSame('pending', $this->statusOf('run-known'));
+    }
+
+    private function statusOf(string $runId): string
+    {
+        return (string) $this->connection->fetchOne(
+            'SELECT status FROM ' . self::TABLE . ' WHERE run_id = ?',
+            [$runId],
+        );
+    }
+
+    private function columnOf(string $runId, string $column): mixed
+    {
+        return $this->connection->fetchOne(
+            "SELECT {$column} FROM " . self::TABLE . ' WHERE run_id = ?',
+            [$runId],
+        );
+    }
+
     private function insertRow(string $runId, string $commandClass, ?string $payload = null): void
     {
         $this->connection->insert(self::TABLE, [
@@ -173,8 +273,10 @@ final class FireQueueConsumerTest extends TestCase
         ]);
     }
 
-    private function makeConsumer(): FireQueueConsumer
-    {
+    private function makeConsumer(
+        ?ConsumerCapabilityResolverInterface $capabilityResolver = null,
+        int $maxAttempts = 10,
+    ): FireQueueConsumer {
         return new FireQueueConsumer(
             connection: $this->connection,
             runStore:   $this->runStore,
@@ -184,7 +286,20 @@ final class FireQueueConsumerTest extends TestCase
             tracer:     new SchedulerTracer(null),
             logger:     new NullLogger(),
             table:      self::TABLE,
+            capabilityResolver: $capabilityResolver,
+            maxAttempts: $maxAttempts,
         );
+    }
+}
+
+final class FakeCapabilityResolver implements ConsumerCapabilityResolverInterface
+{
+    /** @param list<string>|null $capable */
+    public function __construct(private readonly ?array $capable) {}
+
+    public function capableCommandClasses(): ?array
+    {
+        return $this->capable;
     }
 }
 

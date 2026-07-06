@@ -132,6 +132,11 @@ final class SchedulerDoctorTest extends TestCase
             CREATE TABLE vortos_scheduler_fire_queue (
                 id VARCHAR(36) NOT NULL PRIMARY KEY,
                 status VARCHAR(20) NOT NULL DEFAULT "pending",
+                command_class TEXT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at DATETIME NULL,
+                last_error TEXT NULL,
+                dispatched_at DATETIME NULL,
                 created_at DATETIME NOT NULL
             )
         ');
@@ -461,17 +466,17 @@ final class SchedulerDoctorTest extends TestCase
     // full report structure
     // ══════════════════════════════════════════════════════════════════════════
 
-    public function test_report_has_exactly_eleven_findings(): void
+    public function test_report_has_exactly_twelve_findings(): void
     {
         $report = $this->makeDoctor()->run();
-        self::assertCount(11, $report->findings);
+        self::assertCount(12, $report->findings);
     }
 
-    public function test_report_finding_ids_are_c1_through_c11(): void
+    public function test_report_finding_ids_are_c1_through_c12(): void
     {
         $report = $this->makeDoctor()->run();
         $ids = array_map(fn($f) => $f->checkId, $report->findings);
-        foreach (['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11'] as $expected) {
+        foreach (['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12'] as $expected) {
             self::assertContains($expected, $ids);
         }
     }
@@ -621,6 +626,35 @@ final class SchedulerDoctorTest extends TestCase
         $c11 = $this->findCheck($report->findings, 'C11');
         self::assertSame(SchedulerDoctorStatus::Fail, $c11->status);
         self::assertStringContainsString('scheduler:consume', $c11->remediation);
+    }
+
+    public function test_c12_passes_when_no_dead_letters(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $report = $this->makeDoctor(conn: $conn, commandBus: new \stdClass())->run();
+        $c12 = $this->findCheck($report->findings, 'C12');
+        self::assertSame(SchedulerDoctorStatus::Pass, $c12->status);
+    }
+
+    public function test_c12_fails_when_a_fire_is_dead_lettered(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $conn->insert('vortos_scheduler_fire_queue', [
+            'id' => 'row-dl', 'status' => 'dead_letter',
+            'command_class' => 'App\\Shared\\RunDatabaseBackup',
+            'attempts' => 10,
+            'dispatched_at' => $this->clock->now()->format('Y-m-d H:i:s'),
+            'created_at' => $this->clock->now()->modify('-1 hour')->format('Y-m-d H:i:s'),
+        ]);
+
+        $report = $this->makeDoctor(conn: $conn, commandBus: new \stdClass())->run();
+        $c12 = $this->findCheck($report->findings, 'C12');
+        self::assertSame(SchedulerDoctorStatus::Fail, $c12->status);
+        self::assertStringContainsString('RunDatabaseBackup', $c12->detail);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

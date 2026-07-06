@@ -26,7 +26,10 @@ use Vortos\Scheduler\Clock\SystemClock;
 use Vortos\Scheduler\Command\Handler\PruneSchedulerRunsHandler;
 use Vortos\Scheduler\Command\PruneSchedulerRunsCommand;
 use Vortos\Scheduler\Console\SchedulerConsumeCommand;
+use Vortos\Scheduler\Engine\Consumer\AllowlistConsumerCapabilityResolver;
+use Vortos\Scheduler\Engine\Consumer\ConsumerCapabilityResolverInterface;
 use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
+use Vortos\Scheduler\Security\CommandSpecValidator;
 use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Console\RetentionOverrideRemoveCommand;
 use Vortos\Scheduler\Console\RetentionOverrideSetCommand;
@@ -655,6 +658,15 @@ final class SchedulerExtension extends Extension
         $container->register(CommandHydrator::class, CommandHydrator::class)
             ->setPublic(false);
 
+        // R7-4: capability resolver — its CommandSpecValidator dependency is registered by
+        // SchedulableCommandPass only when an #[SchedulableCommand] allowlist exists, so reference
+        // it NULL_ON_INVALID_REFERENCE. A null validator resolves to "no capability filter".
+        $container->register(AllowlistConsumerCapabilityResolver::class, AllowlistConsumerCapabilityResolver::class)
+            ->setArgument('$validator', new Reference(CommandSpecValidator::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setPublic(false);
+        $container->setAlias(ConsumerCapabilityResolverInterface::class, AllowlistConsumerCapabilityResolver::class)
+            ->setPublic(false);
+
         $container->register(FireQueueConsumer::class, FireQueueConsumer::class)
             ->setArgument('$connection', new Reference(Connection::class))
             ->setArgument('$runStore', new Reference(ScheduleRunStoreInterface::class))
@@ -665,6 +677,10 @@ final class SchedulerExtension extends Extension
             ->setArgument('$metrics', new Reference(SchedulerMetricsPort::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$logger', new Reference(LoggerInterface::class))
             ->setArgument('$table', $prefix . 'scheduler_fire_queue')
+            ->setArgument('$capabilityResolver', new Reference(ConsumerCapabilityResolverInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setArgument('$maxAttempts', $config['fire_max_attempts'])
+            ->setArgument('$backoffBaseSec', $config['fire_backoff_base_sec'])
+            ->setArgument('$backoffCapSec', $config['fire_backoff_cap_sec'])
             ->setPublic(false);
 
         $container->register(SchedulerConsumeCommand::class, SchedulerConsumeCommand::class)

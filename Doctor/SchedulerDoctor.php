@@ -84,6 +84,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $this->checkShardConfigValid(),
             $this->checkRetentionStatusValid($now),
             $this->checkFireQueueConsumerHealthy($now),
+            $this->checkFireQueueDeadLetters(),
         ];
 
         return new SchedulerDoctorReport($findings);
@@ -638,6 +639,50 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             '',
             'The fire-queue consumer (scheduler:consume --loop) does not appear to be running or is '
             . 'falling behind — scheduled commands are not executing.',
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // C12 — Fire-queue dead-letters / capability gaps (R7-4)
+    //
+    // A dead-lettered row means NO consumer on the fleet could run a scheduled command after
+    // max_attempts requeues — almost always a capability gap (a command class that never got
+    // deployed to any consumer node, or a permanently stale image). Surface it loudly.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function checkFireQueueDeadLetters(): SchedulerDoctorFinding
+    {
+        $queueTable = $this->tablePrefix . 'scheduler_fire_queue';
+
+        try {
+            $deadLetters = (int) $this->connection->fetchOne(
+                "SELECT COUNT(*) FROM {$queueTable} WHERE status = 'dead_letter'",
+            );
+        } catch (\Throwable) {
+            // Older schema without the requeue columns/status — nothing to assert.
+            return new SchedulerDoctorFinding(
+                'C12',
+                SchedulerDoctorStatus::Skip,
+                'Fire-queue requeue columns not present — dead-letter check skipped.',
+            );
+        }
+
+        if ($deadLetters === 0) {
+            return new SchedulerDoctorFinding('C12', SchedulerDoctorStatus::Pass, 'No dead-lettered fires.');
+        }
+
+        $sampleClass = (string) ($this->connection->fetchOne(
+            "SELECT command_class FROM {$queueTable} WHERE status = 'dead_letter' ORDER BY dispatched_at DESC LIMIT 1",
+        ) ?: 'unknown');
+
+        return new SchedulerDoctorFinding(
+            'C12',
+            SchedulerDoctorStatus::Fail,
+            sprintf('%d fire(s) dead-lettered — no capable consumer ran them.', $deadLetters),
+            sprintf('most recent dead-letter command_class: %s', $sampleClass),
+            'A scheduled command class is not present on any running consumer node. Deploy the command '
+            . 'to a consumer (or add it to #[SchedulableCommand]) and re-enqueue, then investigate the '
+            . 'capability gap (commonly a stale blue/green image).',
         );
     }
 }

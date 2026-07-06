@@ -73,7 +73,7 @@ final class ScheduleDoctorCommandTest extends TestCase
         self::assertArrayHasKey('schema_version', $data);
         self::assertArrayHasKey('clear', $data);
         self::assertArrayHasKey('findings', $data);
-        self::assertCount(11, $data['findings']);
+        self::assertCount(12, $data['findings']);
     }
 
     public function test_doctor_exits_one_when_checks_fail(): void

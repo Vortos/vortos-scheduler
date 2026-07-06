@@ -183,6 +183,44 @@ final class SchedulerMetrics implements SchedulerMetricsPort
         }
     }
 
+    public function recordFireRequeued(string $reason, string $scheduleId, ?string $tenantId): void
+    {
+        if ($this->metrics === null) {
+            return;
+        }
+
+        try {
+            $this->metrics->counter(
+                'vortos_scheduler_fire_requeued_total',
+                [
+                    'reason'      => $reason,
+                    'schedule_id' => $scheduleId,
+                    'tenant_id'   => $tenantId ?? 'system',
+                ],
+            )->increment();
+        } catch (\Throwable) {
+        }
+    }
+
+    public function recordFireDeadLettered(string $reason, string $scheduleId, ?string $tenantId): void
+    {
+        if ($this->metrics === null) {
+            return;
+        }
+
+        try {
+            $this->metrics->counter(
+                'vortos_scheduler_fire_dead_lettered_total',
+                [
+                    'reason'      => $reason,
+                    'schedule_id' => $scheduleId,
+                    'tenant_id'   => $tenantId ?? 'system',
+                ],
+            )->increment();
+        } catch (\Throwable) {
+        }
+    }
+
     public function recordRunsPruned(int $count, ?string $tenantId): void
     {
         if ($this->metrics === null || $count === 0) {

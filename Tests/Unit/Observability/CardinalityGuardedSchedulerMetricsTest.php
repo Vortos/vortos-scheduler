@@ -200,6 +200,20 @@ final class SpyMetricsPort implements SchedulerMetricsPort
         $this->lastConsumeScheduleId = $scheduleId;
     }
 
+    public ?string $lastRequeueScheduleId = null;
+
+    public function recordFireRequeued(string $reason, string $scheduleId, ?string $tenantId): void
+    {
+        $this->lastRequeueScheduleId = $scheduleId;
+    }
+
+    public ?string $lastDeadLetterScheduleId = null;
+
+    public function recordFireDeadLettered(string $reason, string $scheduleId, ?string $tenantId): void
+    {
+        $this->lastDeadLetterScheduleId = $scheduleId;
+    }
+
     public function recordRunsPruned(int $count, ?string $tenantId): void
     {
     }
