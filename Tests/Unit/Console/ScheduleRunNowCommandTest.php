@@ -177,4 +177,48 @@ final class ScheduleRunNowCommandTest extends TestCase
 
         self::assertSame(0, $tester->getStatusCode());
     }
+
+    // ── R8-11 (B7): accept a schedule name, not just a UUID ───────────────────
+
+    public function test_run_now_accepts_a_schedule_name(): void
+    {
+        $this->seedSchedule(); // name 'etl-job'
+        $command = new ScheduleRunNowCommand($this->makeService(), $this->makeResolver());
+        $tester  = new CommandTester($command);
+
+        $tester->execute(['id' => 'etl-job', '--actor' => 'operator-1']);
+
+        self::assertSame(0, $tester->getStatusCode(), $tester->getDisplay());
+        self::assertStringContainsString('Dispatched', $tester->getDisplay());
+    }
+
+    public function test_run_now_unknown_name_is_a_friendly_error(): void
+    {
+        $command = new ScheduleRunNowCommand($this->makeService(), $this->makeResolver());
+        $tester  = new CommandTester($command);
+
+        $tester->execute(['id' => 'no-such-job', '--actor' => 'operator-1']);
+
+        self::assertSame(1, $tester->getStatusCode());
+        self::assertStringContainsString('No schedule named "no-such-job"', $tester->getDisplay());
+    }
+
+    public function test_run_now_uuid_still_works_with_resolver_present(): void
+    {
+        $schedule = $this->seedSchedule();
+        $command  = new ScheduleRunNowCommand($this->makeService(), $this->makeResolver());
+        $tester   = new CommandTester($command);
+
+        $tester->execute(['id' => $schedule->id->toString(), '--actor' => 'operator-1']);
+
+        self::assertSame(0, $tester->getStatusCode());
+    }
+
+    private function makeResolver(): \Vortos\Scheduler\Registry\ScheduleResolver
+    {
+        return new \Vortos\Scheduler\Registry\ScheduleResolver(
+            new StaticScheduleRegistry([]),
+            $this->dynamicStore,
+        );
+    }
 }

@@ -792,6 +792,7 @@ final class SchedulerExtension extends Extension
 
             $container->register(ScheduleRunNowCommand::class, ScheduleRunNowCommand::class)
                 ->setArgument('$service', new Reference(ScheduleService::class))
+                ->setArgument('$resolver', new Reference(ScheduleResolver::class))
                 ->addTag('console.command')
                 ->setPublic(false);
 
