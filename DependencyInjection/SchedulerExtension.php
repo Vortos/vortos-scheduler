@@ -109,6 +109,9 @@ final class SchedulerExtension extends Extension
         // returns — a container parameter is how a resolved config value crosses
         // that boundary, since the pass has no other way to see $config.
         $container->setParameter('vortos_scheduler.lease_driver', $config['lease_driver']);
+        // Same boundary-crossing reason: DeadManDetectorPass registers the detector after every
+        // extension has loaded (see that pass for why it cannot be done here) and needs this value.
+        $container->setParameter('vortos_scheduler.dead_man_tolerance_sec', $config['dead_man_tolerance_sec']);
 
         $this->registerClock($container);
         $this->registerLeaseDrivers($container, $config);
@@ -434,18 +437,11 @@ final class SchedulerExtension extends Extension
                 ->setArgument('$tracer', new Reference(SchedulerTracer::class));
         }
 
-        // DeadManDetector — requires AlertDispatcherInterface from vortos-alerts
-        $alertsClass = 'Vortos\Alerts\AlertDispatcherInterface';
-        if (class_exists($alertsClass) && $container->has($alertsClass) && $container->hasDefinition(DbalScheduleRunStore::class)) {
-            $container->register(DeadManDetector::class, DeadManDetector::class)
-                ->setArgument('$runStore',        new Reference(ScheduleRunStoreInterface::class))
-                ->setArgument('$dispatcher',      new Reference($alertsClass))
-                ->setArgument('$clock',           new Reference(ClockPort::class))
-                ->setArgument('$env',             (string) ($_ENV['APP_ENV'] ?? 'production'))
-                ->setArgument('$defaultToleranceSec', $config['dead_man_tolerance_sec'])
-                ->setArgument('$logger',          new Reference(LoggerInterface::class))
-                ->setPublic(false);
-        }
+        // DeadManDetector is registered by DeadManDetectorPass, NOT here. It depends on
+        // vortos-alerts' AlertDispatcherInterface, and extension load() order across packages is
+        // undefined — checking for another package's service at this point is a race that this
+        // code used to lose silently in production, disabling every overdue-schedule alarm.
+        // See DeadManDetectorPass for the full account.
     }
 
     private function registerDaemon(ContainerBuilder $container, array $config): void
@@ -765,6 +761,10 @@ final class SchedulerExtension extends Extension
             // reflects whether the bus is actually wired in THIS container.
             ->setArgument('$commandBus', new Reference('Vortos\Cqrs\Command\CommandBusInterface', ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setArgument('$consumeStallThresholdSec', $config['consume_stall_threshold_sec'])
+            // Optional, resolved at compile time AFTER DeadManDetectorPass has had its chance to
+            // register the detector — so null here means the alarm genuinely does not exist in
+            // this container, which is exactly what C13 needs to report.
+            ->setArgument('$deadManDetector', new Reference(DeadManDetector::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setPublic(false);
 
         // D: deploy:doctor gate — only registered when vortos-deploy is installed. The

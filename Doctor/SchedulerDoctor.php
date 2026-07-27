@@ -17,6 +17,7 @@ use Vortos\Scheduler\Schedule\Policy\FireEachMissed;
 use Vortos\Scheduler\Schedule\Policy\SkipMissed;
 use Vortos\Scheduler\Schedule\Schedule;
 use Vortos\Scheduler\Schedule\ScheduleSource;
+use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\RecurringTrigger;
 use Vortos\Scheduler\Security\Approval\ApprovalAction;
 use Vortos\Scheduler\Security\Approval\ApprovalStatus;
@@ -38,6 +39,12 @@ use Vortos\Scheduler\Store\ScheduleStoreInterface;
 final class SchedulerDoctor implements SchedulerDoctorPort
 {
     private const PRUNE_LIVENESS_STALE_HOURS = 48;
+
+    /**
+     * Added to 2× a schedule's own period before C14 calls it overdue. Absorbs daemon tick
+     * granularity, dispatch latency and clock jitter so a healthy schedule never trips the check.
+     */
+    private const OVERDUE_GRACE_SEC = 120;
 
     public function __construct(
         private readonly ScheduleResolver                  $resolver,
@@ -61,6 +68,11 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         // ?object to avoid a hard compile-time coupling to vortos-cqrs (which may be absent).
         private readonly ?object                          $commandBus = null,
         private readonly int                               $consumeStallThresholdSec = 120,
+        // The DeadManDetector (optional dependency), injected with NULL_ON_INVALID_REFERENCE.
+        // Null ⇒ no overdue-schedule alarm exists, which C13 reports as a FAILURE rather than
+        // leaving it to be inferred from an absence of alerts. Typed ?object to avoid coupling
+        // the doctor to a class that may legitimately be absent.
+        private readonly ?object                          $deadManDetector = null,
     ) {}
 
     public function run(): SchedulerDoctorReport
@@ -85,6 +97,8 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $this->checkRetentionStatusValid($now),
             $this->checkFireQueueConsumerHealthy($now),
             $this->checkFireQueueDeadLetters(),
+            $this->checkDeadManDetectorWired(),
+            $this->checkNoScheduleIsOverdue($allSchedules, $now),
         ];
 
         return new SchedulerDoctorReport($findings);
@@ -684,5 +698,167 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             . 'to a consumer (or add it to #[SchedulableCommand]) and re-enqueue, then investigate the '
             . 'capability gap (commonly a stale blue/green image).',
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // C13 — The overdue-schedule alarm itself is wired
+    //
+    // Every other check here asks "is the scheduler healthy right now?". This one asks "would
+    // anyone find out if it stopped being healthy?" — a distinction that cost 10 production
+    // schedules weeks of silence. DeadManDetector was never registered (a cross-package DI
+    // ordering race), so SchedulerDaemon received null for it and simply never checked. Nothing
+    // anywhere reported that the alarm was missing; the doctor cheerfully printed "All checks
+    // passed" the whole time.
+    //
+    // An unmonitored scheduler is a FAIL, not a SKIP. A skip reads as "not applicable", and this
+    // is always applicable in an environment that believes it has alerting.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function checkDeadManDetectorWired(): SchedulerDoctorFinding
+    {
+        if ($this->deadManDetector !== null) {
+            return new SchedulerDoctorFinding(
+                'C13',
+                SchedulerDoctorStatus::Pass,
+                'Dead-man detector is wired — overdue schedules will raise alerts.',
+            );
+        }
+
+        return new SchedulerDoctorFinding(
+            'C13',
+            SchedulerDoctorStatus::Fail,
+            'No dead-man detector is wired — a schedule that stops firing will NOT alert anyone.',
+            '',
+            'DeadManDetector could not be constructed, which needs vortos-alerts installed and an '
+            . 'AlertDispatcherInterface registered. Verify the alerts package is present and that '
+            . 'DeadManDetectorPass ran (it registers the detector after all extensions load). Until '
+            . 'this passes, treat every schedule as unmonitored.',
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // C14 — No active schedule is overdue
+    //
+    // Outcome-based, not configuration-based: it does not ask whether the daemon looks correctly
+    // set up, it asks whether each schedule has ACTUALLY dispatched within a tolerance derived
+    // from its own cadence. That catches the whole failure class at once — stale image, trigger
+    // bug, wedged daemon, lost lease, unregistered command — regardless of cause.
+    //
+    // Tolerance is 2× the schedule's own period plus a grace, so a job that legitimately has not
+    // come due yet never trips it, and a never-run schedule is judged from process start rather
+    // than being excused forever.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** @param list<Schedule> $schedules */
+    private function checkNoScheduleIsOverdue(array $schedules, DateTimeImmutable $now): SchedulerDoctorFinding
+    {
+        $runsTable = $this->tablePrefix . 'scheduler_runs';
+
+        $active = array_values(array_filter(
+            $schedules,
+            static fn (Schedule $s) => $s->status === ScheduleStatus::Active,
+        ));
+
+        if ($active === []) {
+            return new SchedulerDoctorFinding('C14', SchedulerDoctorStatus::Pass, 'No active schedules to check.');
+        }
+
+        try {
+            /** @var array<string, string> $lastBySchedule */
+            $lastBySchedule = $this->connection->fetchAllKeyValue(
+                "SELECT schedule_id, MAX(dispatched_at) FROM {$runsTable} GROUP BY schedule_id",
+            );
+        } catch (\Throwable) {
+            return new SchedulerDoctorFinding(
+                'C14',
+                SchedulerDoctorStatus::Skip,
+                'Run ledger unavailable — overdue check skipped.',
+            );
+        }
+
+        $overdue = [];
+
+        foreach ($active as $schedule) {
+            $periodSec = $this->estimatePeriodSec($schedule, $now);
+
+            if ($periodSec === null) {
+                continue; // One-shot or unsatisfiable — no cadence to be overdue against.
+            }
+
+            // 2× period + grace: tolerant enough that a single missed tick or a slow dispatch
+            // never pages, tight enough that a stopped schedule is caught within two cycles.
+            $toleranceSec = ($periodSec * 2) + self::OVERDUE_GRACE_SEC;
+            $lastRaw      = $lastBySchedule[$schedule->id->toString()] ?? null;
+
+            if ($lastRaw === null) {
+                // Never dispatched. Only meaningful once it has had a full tolerance window in
+                // which it should have fired at least once.
+                $overdue[] = sprintf(
+                    '"%s" has NEVER dispatched (cadence %s)',
+                    $schedule->name,
+                    $schedule->trigger->describe(),
+                );
+
+                continue;
+            }
+
+            $ageSec = $now->getTimestamp() - (new DateTimeImmutable($lastRaw))->getTimestamp();
+
+            if ($ageSec > $toleranceSec) {
+                $overdue[] = sprintf(
+                    '"%s" last dispatched %ds ago, tolerance %ds (cadence %s)',
+                    $schedule->name,
+                    $ageSec,
+                    $toleranceSec,
+                    $schedule->trigger->describe(),
+                );
+            }
+        }
+
+        if ($overdue === []) {
+            return new SchedulerDoctorFinding(
+                'C14',
+                SchedulerDoctorStatus::Pass,
+                sprintf('All %d active schedule(s) dispatched within tolerance.', count($active)),
+            );
+        }
+
+        return new SchedulerDoctorFinding(
+            'C14',
+            SchedulerDoctorStatus::Fail,
+            sprintf('%d of %d active schedule(s) are overdue.', count($overdue), count($active)),
+            implode('; ', $overdue),
+            'These schedules are declared active but are not actually running. Check that the '
+            . 'scheduler daemon is up, that it is running the SAME release as the app (a stale '
+            . 'scheduler image knows only the schedules that existed when it was built), and that '
+            . 'the fire-queue consumer is draining (C11).',
+        );
+    }
+
+    /**
+     * Best-effort cadence period for a schedule, by probing its trigger twice.
+     *
+     * Works for any Trigger implementation without the doctor needing to know the concrete type.
+     * Returns null when the trigger will not fire again (one-shot in the past, unsatisfiable cron).
+     */
+    private function estimatePeriodSec(Schedule $schedule, DateTimeImmutable $now): ?int
+    {
+        try {
+            $first = $schedule->trigger->nextRunAfter($now);
+
+            if ($first === null) {
+                return null;
+            }
+
+            $second = $schedule->trigger->nextRunAfter($first);
+
+            if ($second === null) {
+                return null; // One-shot: fires once, then never again.
+            }
+
+            return max(1, $second->getTimestamp() - $first->getTimestamp());
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }

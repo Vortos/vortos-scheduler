@@ -15,11 +15,16 @@ use InvalidArgumentException;
  * last-fired timestamp is the anchor. The fire-ledger slot prevents double-fire
  * even if two daemons race.
  *
+ * Because the anchor is the origin rather than a grid selector, this trigger is an
+ * {@see AnchorRelativeTrigger}: the engine must not slide its cadence cursor forward
+ * across a window in which nothing was due, or the interval restarts every tick and
+ * the schedule never fires. See that interface for the full rationale.
+ *
  * Minimum interval: 1 second. Sub-second intervals are meaningless without
  * sub-second cron support and would cause a busy-poll loop in the daemon.
  * This is validated at construction (fail-fast), not just at scheduler:doctor.
  */
-final readonly class IntervalTrigger implements Trigger
+final readonly class IntervalTrigger implements AnchorRelativeTrigger
 {
     public const MIN_INTERVAL_SECONDS = 1;
 

@@ -8,6 +8,7 @@ use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Extension\ExtensionInterface;
 use Vortos\Foundation\Contract\PackageInterface;
+use Vortos\Scheduler\DependencyInjection\Compiler\DeadManDetectorPass;
 use Vortos\Scheduler\DependencyInjection\Compiler\LeaseDriverPass;
 use Vortos\Scheduler\DependencyInjection\Compiler\SchedulableCommandPass;
 use Vortos\Scheduler\DependencyInjection\Compiler\StaticSchedulePass;
@@ -39,6 +40,14 @@ final class SchedulerPackage implements PackageInterface
             new SchedulableCommandPass(),
             PassConfig::TYPE_BEFORE_OPTIMIZATION,
             -30,
+        );
+        // DeadManDetectorPass wires the overdue-schedule alarm to vortos-alerts. It MUST be a pass
+        // rather than extension load(): it depends on a service another package registers, and
+        // only passes are guaranteed to run after every extension has loaded.
+        $container->addCompilerPass(
+            new DeadManDetectorPass(),
+            PassConfig::TYPE_BEFORE_OPTIMIZATION,
+            -29,
         );
     }
 }

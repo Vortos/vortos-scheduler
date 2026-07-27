@@ -17,6 +17,8 @@ use Vortos\Scheduler\Schedule\ScheduleId;
 use Vortos\Scheduler\Schedule\ScheduleSource;
 use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\IntervalTrigger;
+use Vortos\Scheduler\Schedule\Trigger\RecurringTrigger;
+use Vortos\Scheduler\Schedule\Trigger\Trigger;
 
 /**
  * Unit tests for MisfireResolver (pure, no I/O).
@@ -69,8 +71,11 @@ final class MisfireResolverTest extends TestCase
         self::assertEquals($now, $result->newCursor, 'cursor must advance to now despite skipping');
     }
 
-    public function test_skip_missed_no_due_slots_advances_cursor_to_now(): void
+    public function test_skip_missed_no_due_slots_holds_the_anchor_of_an_interval_trigger(): void
     {
+        // Regression (Bug D): an empty window settles NOTHING, so an anchor-relative trigger must
+        // keep its anchor. Advancing to `now` here re-bases the interval on every tick, which is
+        // how every @every cadence longer than the daemon's tick period silently stopped firing.
         $schedule = $this->makeSchedule(MisfirePolicy::skipMissed());
         $now      = new DateTimeImmutable('2026-07-01T10:30:00Z');
         $cursor   = new DateTimeImmutable('2026-07-01T10:00:00Z'); // nothing due until 11:00
@@ -79,7 +84,61 @@ final class MisfireResolverTest extends TestCase
 
         self::assertCount(0, $result->fires);
         self::assertCount(0, $result->dropped);
-        self::assertEquals($now, $result->newCursor);
+        self::assertEquals($cursor, $result->newCursor, 'anchor must not slide across an empty window');
+    }
+
+    public function test_hourly_interval_still_fires_when_ticked_every_minute(): void
+    {
+        // The production failure, reproduced end to end: a 3600s schedule ticked every 60s. Before
+        // the fix this loop fired zero times no matter how long it ran; the cursor advanced each
+        // tick and `cursor + 3600s` was forever in the future.
+        $schedule = $this->makeSchedule(MisfirePolicy::skipMissed());
+        $cursor   = new DateTimeImmutable('2026-07-01T10:00:00Z');
+
+        $totalFires = 0;
+
+        // 180 one-minute ticks = 3 hours of wall clock.
+        for ($minute = 1; $minute <= 180; $minute++) {
+            $now    = new DateTimeImmutable('2026-07-01T10:00:00Z')->modify("+{$minute} minutes");
+            $result = $this->resolver->resolve($schedule, $cursor, $now);
+
+            $totalFires += count($result->fires);
+            $cursor      = $result->newCursor;
+        }
+
+        self::assertSame(3, $totalFires, 'an hourly schedule must fire exactly 3× in 3 hours');
+    }
+
+    public function test_absolute_cron_trigger_still_slides_its_cursor_across_an_empty_window(): void
+    {
+        // The hold applies ONLY to anchor-relative triggers. A cron trigger's next instant is grid
+        // -selected, so sliding is a no-op on the answer and keeps sparse schedules off the
+        // catch-up horizon. Guards against over-applying the fix.
+        $schedule = $this->makeSchedule(
+            MisfirePolicy::skipMissed(),
+            trigger: new RecurringTrigger('0 * * * *', $this->utcTz), // top of every hour
+        );
+        $now    = new DateTimeImmutable('2026-07-01T10:30:00Z');
+        $cursor = new DateTimeImmutable('2026-07-01T10:00:00Z');
+
+        $result = $this->resolver->resolve($schedule, $cursor, $now);
+
+        self::assertCount(0, $result->fires);
+        self::assertEquals($now, $result->newCursor, 'absolute triggers still advance');
+    }
+
+    public function test_skip_missed_interval_does_not_deadlock_when_slots_are_skipped(): void
+    {
+        // The other half of the contract: holding the anchor on an EMPTY window must not resurrect
+        // the Bug C deadlock. A skipped batch has candidates, so it is settled and still advances.
+        $schedule = $this->makeSchedule(MisfirePolicy::skipMissed());
+        $cursor   = new DateTimeImmutable('2026-07-01T10:00:00Z');
+        $now      = new DateTimeImmutable('2026-07-01T13:00:01Z'); // slots 11, 12, 13 → skipped
+
+        $result = $this->resolver->resolve($schedule, $cursor, $now);
+
+        self::assertCount(0, $result->fires);
+        self::assertEquals($now, $result->newCursor, 'a collapsed batch is settled and must advance');
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -250,13 +309,16 @@ final class MisfireResolverTest extends TestCase
     // Helpers
     // ─────────────────────────────────────────────────────────────
 
-    private function makeSchedule(MisfirePolicy $misfire, ?string $tenantId = 'ta'): Schedule
-    {
+    private function makeSchedule(
+        MisfirePolicy $misfire,
+        ?string       $tenantId = 'ta',
+        ?Trigger      $trigger = null,
+    ): Schedule {
         return new Schedule(
             id:        ScheduleId::generate(),
             name:      'test-misfire-schedule',
             source:    ScheduleSource::Static,
-            trigger:   new IntervalTrigger(3600), // every hour
+            trigger:   $trigger ?? new IntervalTrigger(3600), // every hour
             command:   new CommandSpec('Vortos\Scheduler\Tests\Unit\Engine\FakeCommand'),
             misfire:   $misfire,
             overlap:   OverlapPolicy::AllowConcurrent,

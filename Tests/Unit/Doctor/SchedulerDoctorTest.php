@@ -22,6 +22,7 @@ use Vortos\Scheduler\Schedule\ScheduleId;
 use Vortos\Scheduler\Schedule\ScheduleSource;
 use Vortos\Scheduler\Schedule\ScheduleStatus;
 use Vortos\Scheduler\Schedule\Trigger\IntervalTrigger;
+use Vortos\Scheduler\Schedule\Trigger\Trigger;
 use Vortos\Scheduler\Security\CommandSpecValidator;
 use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
 use Vortos\Scheduler\Testing\InMemoryScheduleStore;
@@ -51,12 +52,13 @@ final class SchedulerDoctorTest extends TestCase
         bool $sensitive = false,
         MisfirePolicy $misfire = null,
         array $metadata = [],
+        ?Trigger $trigger = null,
     ): Schedule {
         return new Schedule(
             id:        ScheduleId::generate(),
             name:      $name,
             source:    ScheduleSource::Dynamic,
-            trigger:   new IntervalTrigger(3600),
+            trigger:   $trigger ?? new IntervalTrigger(3600),
             command:   new CommandSpec('App\Command\TestCommand'),
             misfire:   $misfire ?? MisfirePolicy::skipMissed(),
             overlap:   OverlapPolicy::AllowConcurrent,
@@ -89,6 +91,7 @@ final class SchedulerDoctorTest extends TestCase
         \Vortos\Scheduler\Store\RunRetentionOverrideStoreInterface $retentionOverrideStore = null,
         ?object $commandBus = null,
         int $consumeStallThresholdSec = 120,
+        ?object $deadManDetector = null,
     ): SchedulerDoctor {
         $reg      = $registry ?? new StaticScheduleRegistry([]);
         $overrides = new InMemoryScheduleStatusOverrideStore();
@@ -110,7 +113,122 @@ final class SchedulerDoctorTest extends TestCase
             retentionOverrideStore:     $retentionOverrideStore,
             commandBus:                 $commandBus,
             consumeStallThresholdSec:   $consumeStallThresholdSec,
+            deadManDetector:            $deadManDetector,
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // C13 — The overdue-schedule alarm itself is wired
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function test_c13_fails_when_no_dead_man_detector_is_wired(): void
+    {
+        // The production condition: a DI ordering race left DeadManDetector unregistered, so no
+        // schedule could ever raise an overdue alert — and nothing said so. An unmonitored
+        // scheduler must fail the doctor, never merely skip.
+        $report = $this->makeDoctor(deadManDetector: null)->run();
+        $c13    = $this->findCheck($report->findings, 'C13');
+
+        self::assertSame(SchedulerDoctorStatus::Fail, $c13->status);
+        self::assertStringContainsString('NOT alert', $c13->summary);
+    }
+
+    public function test_c13_passes_when_a_dead_man_detector_is_wired(): void
+    {
+        $report = $this->makeDoctor(deadManDetector: new \stdClass())->run();
+        $c13    = $this->findCheck($report->findings, 'C13');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c13->status);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // C14 — No active schedule is overdue
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function test_c14_fails_for_a_schedule_that_has_never_dispatched(): void
+    {
+        // Exactly the production shape: declared active, visible in scheduler:list, zero rows in
+        // the run ledger. Before C14 existed the doctor reported "All checks passed" in this state.
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $this->dynamicStore->seed($this->makeSchedule('payment-reminders', trigger: new IntervalTrigger(86400)));
+
+        $report = $this->makeDoctor(conn: $conn)->run();
+        $c14    = $this->findCheck($report->findings, 'C14');
+
+        self::assertSame(SchedulerDoctorStatus::Fail, $c14->status);
+        self::assertStringContainsString('payment-reminders', $c14->detail);
+        self::assertStringContainsString('NEVER dispatched', $c14->detail);
+    }
+
+    public function test_c14_fails_for_a_schedule_that_stopped_dispatching(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $schedule = $this->makeSchedule('notification-retry', trigger: new IntervalTrigger(300));
+        $this->dynamicStore->seed($schedule);
+
+        // Last dispatch 2 hours ago; tolerance is 2×300s + 120s grace = 720s.
+        $this->insertRun($conn, $schedule, $this->clock->now()->modify('-2 hours'));
+
+        $report = $this->makeDoctor(conn: $conn)->run();
+        $c14    = $this->findCheck($report->findings, 'C14');
+
+        self::assertSame(SchedulerDoctorStatus::Fail, $c14->status);
+        self::assertStringContainsString('notification-retry', $c14->detail);
+    }
+
+    public function test_c14_passes_for_a_schedule_dispatching_on_cadence(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $schedule = $this->makeSchedule('registration-file-reconciler', trigger: new IntervalTrigger(60));
+        $this->dynamicStore->seed($schedule);
+
+        $this->insertRun($conn, $schedule, $this->clock->now()->modify('-30 seconds'));
+
+        $report = $this->makeDoctor(conn: $conn)->run();
+        $c14    = $this->findCheck($report->findings, 'C14');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c14->status);
+    }
+
+    public function test_c14_does_not_false_alarm_on_an_infrequent_schedule(): void
+    {
+        // A monthly job that ran a week ago is healthy, not overdue. Tolerance derives from the
+        // schedule's OWN cadence, so rare jobs must never page.
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $schedule = $this->makeSchedule('monthly-report', trigger: new IntervalTrigger(30 * 86400));
+        $this->dynamicStore->seed($schedule);
+
+        $this->insertRun($conn, $schedule, $this->clock->now()->modify('-7 days'));
+
+        $report = $this->makeDoctor(conn: $conn)->run();
+        $c14    = $this->findCheck($report->findings, 'C14');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c14->status);
+    }
+
+    private function insertRun(
+        \Doctrine\DBAL\Connection $conn,
+        Schedule $schedule,
+        \DateTimeImmutable $dispatchedAt,
+    ): void {
+        $conn->insert('vortos_scheduler_runs', [
+            'run_id'        => bin2hex(random_bytes(16)),
+            'schedule_id'   => $schedule->id->toString(),
+            'tenant_id'     => $schedule->tenantId,
+            'slot'          => 'slot-' . $dispatchedAt->getTimestamp(),
+            'scheduled_for' => $dispatchedAt->format('Y-m-d H:i:s'),
+            'dispatched_at' => $dispatchedAt->format('Y-m-d H:i:s'),
+            'run_state'     => 'completed',
+            'attempt'       => 1,
+        ]);
     }
 
     private function makeRunsAndQueueTables(\Doctrine\DBAL\Connection $conn): void
@@ -183,7 +301,7 @@ final class SchedulerDoctorTest extends TestCase
             id:        ScheduleId::generate(),
             name:      \Vortos\Scheduler\Tests\Unit\Service\Support\FixedStaticScheduleDefinition::SCHEDULE_NAME,
             source:    ScheduleSource::Dynamic,
-            trigger:   new IntervalTrigger(3600),
+            trigger:   $trigger ?? new IntervalTrigger(3600),
             command:   new CommandSpec('App\Command\TestCommand'),
             misfire:   MisfirePolicy::skipMissed(),
             overlap:   OverlapPolicy::AllowConcurrent,
@@ -466,17 +584,17 @@ final class SchedulerDoctorTest extends TestCase
     // full report structure
     // ══════════════════════════════════════════════════════════════════════════
 
-    public function test_report_has_exactly_twelve_findings(): void
+    public function test_report_has_exactly_fourteen_findings(): void
     {
         $report = $this->makeDoctor()->run();
-        self::assertCount(12, $report->findings);
+        self::assertCount(14, $report->findings);
     }
 
-    public function test_report_finding_ids_are_c1_through_c12(): void
+    public function test_report_finding_ids_are_c1_through_c14(): void
     {
         $report = $this->makeDoctor()->run();
         $ids = array_map(fn($f) => $f->checkId, $report->findings);
-        foreach (['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12'] as $expected) {
+        foreach (['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12', 'C13', 'C14'] as $expected) {
             self::assertContains($expected, $ids);
         }
     }
@@ -486,12 +604,17 @@ final class SchedulerDoctorTest extends TestCase
         // With no schedules and an in-memory lease store:
         // C1=Pass, C2=Pass, C3=Skip(no validator), C4=Pass, C5=Fail(no tables),
         // C6=Skip(no approval store), C7=Pass, C8=Pass, C9=Pass,
-        // C10=Pass(runRetentionDays defaults to 0/disabled), C11=Skip(consumer not installed)
+        // C10=Pass(runRetentionDays defaults to 0/disabled), C11=Skip(consumer not installed),
+        // C13=Fail(no dead-man detector passed to this bare doctor), C14=Pass(no schedules).
+        //
+        // C13 failing here is the intended contract, not test noise: a doctor constructed without
+        // a DeadManDetector is describing an unmonitored scheduler, and that must never read as
+        // healthy. See SchedulerDoctor::checkDeadManDetectorWired().
         $report = $this->makeDoctor()->run();
         $fails = array_filter($report->findings, fn($f) => $f->isFailure());
-        // Only C5 (migrations) should fail in this setup
-        self::assertCount(1, $fails);
-        self::assertSame('C5', current($fails)->checkId);
+        $failIds = array_map(fn($f) => $f->checkId, array_values($fails));
+        sort($failIds);
+        self::assertSame(['C13', 'C5'], $failIds === ['C13', 'C5'] ? ['C13', 'C5'] : $failIds);
     }
 
     // ══════════════════════════════════════════════════════════════════════════

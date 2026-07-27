@@ -23,7 +23,12 @@ use Vortos\Scheduler\Testing\InMemoryScheduleStore;
  */
 final class ScheduleDoctorCommandTest extends TestCase
 {
-    private function makeDoctor(array $tables = []): SchedulerDoctor
+    /**
+     * @param bool $withDeadMan Whether the doctor is given an overdue-schedule alarm. The
+     *                          "all checks pass" cases MUST pass true: C13 fails without one, by
+     *                          design — a scheduler nobody is watching is not a healthy scheduler.
+     */
+    private function makeDoctor(array $tables = [], bool $withDeadMan = false): SchedulerDoctor
     {
         $clock      = new MutableClock(new DateTimeImmutable('2026-07-01T12:00:00+00:00'));
         $dynamicStore = new InMemoryScheduleStore();
@@ -48,6 +53,7 @@ final class ScheduleDoctorCommandTest extends TestCase
             tablePrefix:      'vortos_',
             shardCount:       1,
             maxCatchupAgeSec: 86400,
+            deadManDetector:  $withDeadMan ? new \stdClass() : null,
         );
     }
 
@@ -73,7 +79,7 @@ final class ScheduleDoctorCommandTest extends TestCase
         self::assertArrayHasKey('schema_version', $data);
         self::assertArrayHasKey('clear', $data);
         self::assertArrayHasKey('findings', $data);
-        self::assertCount(12, $data['findings']);
+        self::assertCount(14, $data['findings']);
     }
 
     public function test_doctor_exits_one_when_checks_fail(): void
@@ -96,7 +102,7 @@ final class ScheduleDoctorCommandTest extends TestCase
             'vortos_scheduler_fire_queue',
             'vortos_scheduler_run_retention_overrides',
         ];
-        $command = new ScheduleDoctorCommand($this->makeDoctor($tables));
+        $command = new ScheduleDoctorCommand($this->makeDoctor($tables, withDeadMan: true));
         $tester  = new CommandTester($command);
         $tester->execute([]);
         // All checks pass (C3 and C6 skip, which is not a failure)
@@ -134,7 +140,7 @@ final class ScheduleDoctorCommandTest extends TestCase
             'vortos_scheduler_fire_queue',
             'vortos_scheduler_run_retention_overrides',
         ];
-        $command = new ScheduleDoctorCommand($this->makeDoctor($tables));
+        $command = new ScheduleDoctorCommand($this->makeDoctor($tables, withDeadMan: true));
         $tester  = new CommandTester($command);
         $tester->execute([]);
         self::assertStringContainsString('healthy', strtolower($tester->getDisplay()));

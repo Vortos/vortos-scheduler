@@ -11,6 +11,7 @@ use Vortos\Scheduler\Schedule\Policy\FireOnceNow;
 use Vortos\Scheduler\Schedule\Policy\MisfirePolicy;
 use Vortos\Scheduler\Schedule\Policy\SkipMissed;
 use Vortos\Scheduler\Schedule\Schedule;
+use Vortos\Scheduler\Schedule\Trigger\AnchorRelativeTrigger;
 
 /**
  * Pure engine — no I/O, no DBAL, no clock calls.
@@ -82,7 +83,7 @@ final class MisfireResolver
         }
 
         $fires     = $this->applyPolicy($schedule->misfire, $candidates);
-        $newCursor = $this->computeNewCursor($schedule->misfire, $candidates, $fires, $now, $workCursor);
+        $newCursor = $this->computeNewCursor($schedule, $candidates, $fires, $now, $workCursor);
 
         return new MisfireResolution(fires: $fires, dropped: $dropped, newCursor: $newCursor);
     }
@@ -125,18 +126,35 @@ final class MisfireResolver
      * A FireEachMissed batch that hit its cap has UNfired candidates remaining, so the cursor stops
      * at the last fired slot — the remainder drains on the next tick instead of being abandoned.
      *
+     * EMPTY WINDOW + ANCHOR-RELATIVE TRIGGER: nothing was enumerated, so nothing was settled. For
+     * an absolute trigger (cron, one-shot) sliding the cursor to `now` is a no-op on the answer, so
+     * we still do it — that keeps enumeration cheap and keeps sparse schedules away from the
+     * catch-up horizon. For an {@see AnchorRelativeTrigger} the cursor IS the origin of the next
+     * fire, so sliding it forward re-bases the interval on every tick and the schedule can never
+     * reach its own cadence. Such a schedule holds its anchor until a slot actually lands.
+     *
+     * This does NOT reintroduce the SkipMissed deadlock (Bug C): a skipped batch has candidates,
+     * so the window was settled by deliberate collapse and the cursor still advances to now. Only
+     * the genuinely-empty window holds.
+     *
      * Never returns a value below $workCursor (guards clock skew / future cursors).
      *
      * @param list<ScheduledFire> $candidates
      * @param list<ScheduledFire> $fires
      */
     private function computeNewCursor(
-        MisfirePolicy     $policy,
+        Schedule          $schedule,
         array             $candidates,
         array             $fires,
         DateTimeImmutable $now,
         DateTimeImmutable $workCursor,
     ): DateTimeImmutable {
+        $policy = $schedule->misfire;
+
+        if ($candidates === [] && $schedule->trigger instanceof AnchorRelativeTrigger) {
+            return $workCursor;
+        }
+
         if ($policy instanceof FireEachMissed && count($fires) < count($candidates) && $fires !== []) {
             $base = end($fires)->scheduledFor;
         } else {
