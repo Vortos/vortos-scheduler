@@ -313,31 +313,23 @@ final class SchedulerExtension extends Extension
                 ->setPublic(false);
         }
 
-        // RBAC policy: real implementation when vortos-authorization is installed,
-        // NullSchedulePolicy otherwise.
-        $policyEngineClass = 'Vortos\Authorization\Engine\PolicyEngine';
-        if (class_exists($policyEngineClass) && $container->hasDefinition($policyEngineClass)) {
-            // Register resource policy and permission catalog (tagged for auto-discovery)
-            $container->register(SchedulerResourcePolicy::class, SchedulerResourcePolicy::class)
-                ->addTag('vortos.policy', ['resource' => 'scheduler'])
-                ->setPublic(false);
+        // The fallback only. SchedulePolicyWiringPass UPGRADES this to the real RBAC policy when
+        // vortos-authorization's engine is present.
+        //
+        // Deciding here meant `class_exists($engine) && $container->hasDefinition($engine)`, and
+        // hasDefinition() during load() is a race against that package's extension. Losing it
+        // silently left NullSchedulePolicy in place, so the scheduler's authorisation checks
+        // permitted everything on a deployment that HAS authorization installed — a security
+        // control failing open because of extension ordering, with nothing erroring and nothing
+        // logging.
+        //
+        // Registering the fallback here (rather than only in the pass) keeps a container built from
+        // this extension alone — as the integration tests do — complete and bootable.
+        $container->register(NullSchedulePolicy::class, NullSchedulePolicy::class)
+            ->setArgument('$logger', new Reference(LoggerInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setPublic(false);
 
-            $container->register(SchedulerPermissionCatalog::class, SchedulerPermissionCatalog::class)
-                ->addTag('vortos.permission_catalog', ['resource' => 'scheduler'])
-                ->setPublic(false);
-
-            $container->register(SchedulePolicy::class, SchedulePolicy::class)
-                ->setArgument('$policyEngine', new Reference($policyEngineClass))
-                ->setPublic(false);
-
-            $container->setAlias(SchedulePolicyInterface::class, SchedulePolicy::class);
-        } else {
-            $container->register(NullSchedulePolicy::class, NullSchedulePolicy::class)
-                ->setArgument('$logger', new Reference(LoggerInterface::class))
-                ->setPublic(false);
-
-            $container->setAlias(SchedulePolicyInterface::class, NullSchedulePolicy::class);
-        }
+        $container->setAlias(SchedulePolicyInterface::class, NullSchedulePolicy::class);
     }
 
     private function registerAudit(ContainerBuilder $container, array $config): void

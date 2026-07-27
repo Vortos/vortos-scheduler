@@ -22,6 +22,13 @@ final class SchedulerPackage implements PackageInterface
 
     public function build(ContainerBuilder $container): void
     {
+        // Decide the RBAC policy after every extension has loaded; see SchedulePolicyWiringPass.
+        $container->addCompilerPass(
+            new \Vortos\Scheduler\DependencyInjection\Compiler\SchedulePolicyWiringPass(),
+            \Symfony\Component\DependencyInjection\Compiler\PassConfig::TYPE_BEFORE_OPTIMIZATION,
+            -20,
+        );
+
         // StaticSchedulePass runs first: discovers and validates static schedule definitions.
         // LeaseDriverPass runs after: validates the lease driver is reachable.
         $container->addCompilerPass(
