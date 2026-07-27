@@ -46,10 +46,20 @@ final class SchedulerPreflightCheck implements PreflightCheckInterface
             );
         }
 
-        if (!$report->isClear()) {
+        // Only DEPLOY-BLOCKING failures gate. Runtime-state checks (C14, overdue schedules) stay
+        // visible in `scheduler:doctor` and in alerting, but must not veto a release — a stalled
+        // schedule is usually fixed BY deploying, so gating on it deadlocks the fix behind the
+        // symptom. That is not hypothetical: the release that fixed the interval-trigger bug was
+        // refused by the check reporting the 11 schedules that bug had stalled.
+        $blocking = array_filter(
+            $report->findings,
+            fn (SchedulerDoctorFinding $f) => $f->isDeployBlockingFailure(),
+        );
+
+        if ($blocking !== []) {
             $failMessages = array_map(
                 fn (SchedulerDoctorFinding $f) => "[{$f->checkId}] {$f->summary}",
-                array_filter($report->findings, fn (SchedulerDoctorFinding $f) => $f->isFailure()),
+                $blocking,
             );
 
             return PreflightFinding::fail(
@@ -58,6 +68,26 @@ final class SchedulerPreflightCheck implements PreflightCheckInterface
                 sprintf('%d scheduler doctor check(s) failed.', count($failMessages)),
                 detail: implode('; ', $failMessages),
                 remediation: 'Run `php bin/console scheduler:doctor` for per-check details and fix instructions.',
+            );
+        }
+
+        // Non-gating failures are still surfaced, so a passing gate never hides them from the
+        // deploy log — the operator sees them, the pipeline just does not stop for them.
+        $advisory = array_map(
+            fn (SchedulerDoctorFinding $f) => "[{$f->checkId}] {$f->summary}",
+            array_filter($report->findings, fn (SchedulerDoctorFinding $f) => $f->isFailure()),
+        );
+
+        if ($advisory !== []) {
+            return PreflightFinding::pass(
+                $this->id(),
+                $this->category(),
+                sprintf(
+                    '%d scheduler doctor check(s) passed the deploy gate; %d runtime-state warning(s).',
+                    count($report->findings) - count($advisory),
+                    count($advisory),
+                ),
+                detail: 'Not blocking, but investigate: ' . implode('; ', $advisory),
             );
         }
 

@@ -832,6 +832,9 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             . 'scheduler daemon is up, that it is running the SAME release as the app (a stale '
             . 'scheduler image knows only the schedules that existed when it was built), and that '
             . 'the fire-queue consumer is draining (C11).',
+            // Runtime state, not deployability: overdue schedules are very often fixed BY the
+            // deployment being gated. See SchedulerDoctorFinding::$gatesDeploy.
+            gatesDeploy: false,
         );
     }
 
