@@ -63,7 +63,12 @@ final class CommandHydrator
             $name = $param->getName();
 
             if (array_key_exists($name, $payload)) {
-                $args[$name] = $this->coerce($param->getType(), $payload[$name]);
+                // getType() is ?ReflectionType — a union or intersection type is neither null nor
+                // ReflectionNamedType, and passing one to coerce() was a fatal TypeError waiting on
+                // the first command constructor to declare `int|string`. Anything not named is
+                // handed through uncoerced, which is what coerce() does for an unknown type anyway.
+                $type = $param->getType();
+                $args[$name] = $this->coerce($type instanceof \ReflectionNamedType ? $type : null, $payload[$name]);
 
                 continue;
             }
