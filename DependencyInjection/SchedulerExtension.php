@@ -402,8 +402,13 @@ final class SchedulerExtension extends Extension
         }
 
         // Wire the SchedulerMetrics service — null MetricsInterface when not installed.
-        $metricsRef = interface_exists(MetricsInterface::class) && $container->has(MetricsInterface::class)
-            ? new Reference(MetricsInterface::class)
+        //
+        // The has() that used to sit beside interface_exists() here was a race: it asks whether
+        // vortos-metrics has REGISTERED the service yet, which during load() depends on extension
+        // order. NULL_ON_INVALID_REFERENCE asks the same question after every extension has loaded
+        // and degrades to null exactly as intended, so the guard is now purely "is it installed?".
+        $metricsRef = interface_exists(MetricsInterface::class)
+            ? new Reference(MetricsInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE)
             : null;
 
         $container->register(SchedulerMetrics::class, SchedulerMetrics::class)
@@ -422,9 +427,11 @@ final class SchedulerExtension extends Extension
 
     private function registerObservability(ContainerBuilder $container, array $config): void
     {
-        // SchedulerTracer — wraps framework TracingInterface (null = no-op)
-        $tracerRef = interface_exists(TracingInterface::class) && $container->has(TracingInterface::class)
-            ? new Reference(TracingInterface::class)
+        // SchedulerTracer — wraps framework TracingInterface (null = no-op). Same correction as
+        // $metricsRef above: installed-ness is order-free, registered-ness is not, so the latter is
+        // deferred to the container via NULL_ON_INVALID_REFERENCE.
+        $tracerRef = interface_exists(TracingInterface::class)
+            ? new Reference(TracingInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE)
             : null;
 
         $container->register(SchedulerTracer::class, SchedulerTracer::class)
