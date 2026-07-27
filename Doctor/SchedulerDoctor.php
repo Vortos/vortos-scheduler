@@ -763,10 +763,19 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             return new SchedulerDoctorFinding('C14', SchedulerDoctorStatus::Pass, 'No active schedules to check.');
         }
 
+        $cursorsTable = $this->tablePrefix . 'scheduler_cursors';
+
         try {
             /** @var array<string, string> $lastBySchedule */
             $lastBySchedule = $this->connection->fetchAllKeyValue(
                 "SELECT schedule_id, MAX(dispatched_at) FROM {$runsTable} GROUP BY schedule_id",
+            );
+
+            // When the daemon first observed each schedule. Without this a schedule that has never
+            // dispatched is indistinguishable from one that has stopped — both have no run rows.
+            /** @var array<string, string|null> $firstSeenBySchedule */
+            $firstSeenBySchedule = $this->connection->fetchAllKeyValue(
+                "SELECT schedule_id, first_seen_at FROM {$cursorsTable}",
             );
         } catch (\Throwable) {
             return new SchedulerDoctorFinding(
@@ -791,11 +800,31 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $lastRaw      = $lastBySchedule[$schedule->id->toString()] ?? null;
 
             if ($lastRaw === null) {
-                // Never dispatched. Only meaningful once it has had a full tolerance window in
-                // which it should have fired at least once.
+                // Never dispatched — which is only a fault once the schedule has EXISTED long
+                // enough to have fired at least once. Reporting it sooner means every deployment
+                // that introduces a schedule fails this check until that schedule's first slot
+                // arrives; for a daily job that is a full day of false alarms, which is precisely
+                // how a check teaches people to ignore it.
+                $firstSeenRaw = $firstSeenBySchedule[$schedule->id->toString()] ?? null;
+
+                if ($firstSeenRaw === null) {
+                    // Either the daemon has not scanned it yet (no cursor), or the cursor predates
+                    // first_seen_at. Both are genuinely unknown, and guessing in either direction
+                    // is worse than staying silent: this check exists to be believed.
+                    continue;
+                }
+
+                $knownForSec = $now->getTimestamp()
+                    - (new DateTimeImmutable($firstSeenRaw))->getTimestamp();
+
+                if ($knownForSec <= $toleranceSec) {
+                    continue; // Too new to have been due yet.
+                }
+
                 $overdue[] = sprintf(
-                    '"%s" has NEVER dispatched (cadence %s)',
+                    '"%s" has NEVER dispatched in the %ds since it was first seen (cadence %s)',
                     $schedule->name,
+                    $knownForSec,
                     $schedule->trigger->describe(),
                 );
 

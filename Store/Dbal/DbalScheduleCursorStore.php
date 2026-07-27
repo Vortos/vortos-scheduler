@@ -37,12 +37,12 @@ final class DbalScheduleCursorStore implements ScheduleCursorStoreInterface
         $placeholders = implode(',', array_fill(0, count($ids), '?'));
 
         if ($tenantId !== null) {
-            $sql = "SELECT schedule_id, tenant_id, cursor_at, cursor_version
+            $sql = "SELECT schedule_id, tenant_id, cursor_at, cursor_version, first_seen_at
                     FROM {$this->table}
                     WHERE schedule_id IN ({$placeholders}) AND tenant_id = ?";
             $params = [...$ids, $tenantId];
         } else {
-            $sql = "SELECT schedule_id, tenant_id, cursor_at, cursor_version
+            $sql = "SELECT schedule_id, tenant_id, cursor_at, cursor_version, first_seen_at
                     FROM {$this->table}
                     WHERE schedule_id IN ({$placeholders})";
             $params = $ids;
@@ -58,6 +58,11 @@ final class DbalScheduleCursorStore implements ScheduleCursorStoreInterface
                 tenantId:   $row['tenant_id'] !== null ? (string) $row['tenant_id'] : null,
                 cursorAt:   new DateTimeImmutable((string) $row['cursor_at'], new DateTimeZone('UTC')),
                 version:    (int) $row['cursor_version'],
+                // isset() already excludes null; NULL here means the row predates the column and
+                // the first-seen instant is genuinely unknown.
+                firstSeenAt: isset($row['first_seen_at'])
+                    ? new DateTimeImmutable((string) $row['first_seen_at'], new DateTimeZone('UTC'))
+                    : null,
             );
         }
 
@@ -81,6 +86,10 @@ final class DbalScheduleCursorStore implements ScheduleCursorStoreInterface
                     'cursor_at'      => $cursorAt,
                     'cursor_version' => 1,
                     'updated_at'     => $now,
+                    // Written once, on the insert that first anchors this schedule. Never touched
+                    // by advance() — it records when the daemon first saw the schedule, not when
+                    // it last moved.
+                    'first_seen_at'  => $now,
                 ]);
 
                 return true;

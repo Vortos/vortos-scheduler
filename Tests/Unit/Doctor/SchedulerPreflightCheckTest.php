@@ -175,6 +175,47 @@ final class SchedulerPreflightCheckTest extends TestCase
         self::assertFalse($finding->isFailure());
         self::assertStringContainsString('9', $finding->summary);
     }
+
+    public function test_a_runtime_state_failure_does_not_block_the_deploy(): void
+    {
+        // Regression: the release that fixed the interval-trigger bug was REFUSED by the deploy
+        // gate, because C14 correctly reported the 11 schedules that same bug had stalled. A gate
+        // that blocks the remedy on the symptom is a deadlock, so runtime-state findings are
+        // advisory here while staying a hard failure in `scheduler:doctor`.
+        $this->doctor->report = new SchedulerDoctorReport([
+            new SchedulerDoctorFinding('C1', SchedulerDoctorStatus::Pass, 'fine'),
+            new SchedulerDoctorFinding(
+                'C14',
+                SchedulerDoctorStatus::Fail,
+                '11 of 15 active schedule(s) are overdue.',
+                'payment-reminders has NEVER dispatched',
+                'remediation',
+                gatesDeploy: false,
+            ),
+        ]);
+
+        $finding = $this->check->check($this->context);
+
+        self::assertFalse($finding->isFailure(), 'runtime state must not gate the deploy');
+        self::assertStringContainsString('runtime-state warning', $finding->summary);
+        // Still visible: silently passing would hide a real problem from the deploy log.
+        self::assertStringContainsString('C14', $finding->detail);
+    }
+
+    public function test_a_configuration_failure_still_blocks_the_deploy(): void
+    {
+        // The other half of the contract: capability/configuration failures must keep gating, or
+        // making C14 advisory would have quietly disarmed the whole preflight.
+        $this->doctor->report = new SchedulerDoctorReport([
+            new SchedulerDoctorFinding('C3', SchedulerDoctorStatus::Fail, 'command not allowlisted'),
+            new SchedulerDoctorFinding('C14', SchedulerDoctorStatus::Fail, 'overdue', '', '', gatesDeploy: false),
+        ]);
+
+        $finding = $this->check->check($this->context);
+
+        self::assertTrue($finding->isFailure());
+        self::assertStringContainsString('C3', $finding->detail);
+    }
 }
 
 // ── Test doubles ──────────────────────────────────────────────────────────────

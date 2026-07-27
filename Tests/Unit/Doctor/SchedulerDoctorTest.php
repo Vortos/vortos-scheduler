@@ -152,7 +152,10 @@ final class SchedulerDoctorTest extends TestCase
         $conn = $this->makeSqliteConnection();
         $this->makeRunsAndQueueTables($conn);
 
-        $this->dynamicStore->seed($this->makeSchedule('payment-reminders', trigger: new IntervalTrigger(86400)));
+        $schedule = $this->makeSchedule('payment-reminders', trigger: new IntervalTrigger(86400));
+        $this->dynamicStore->seed($schedule);
+        // Known for a week: well past 2x its daily cadence, so silence here is a real fault.
+        $this->seedFirstSeen($conn, $schedule, 7 * 86400);
 
         $report = $this->makeDoctor(conn: $conn)->run();
         $c14    = $this->findCheck($report->findings, 'C14');
@@ -160,6 +163,41 @@ final class SchedulerDoctorTest extends TestCase
         self::assertSame(SchedulerDoctorStatus::Fail, $c14->status);
         self::assertStringContainsString('payment-reminders', $c14->detail);
         self::assertStringContainsString('NEVER dispatched', $c14->detail);
+    }
+
+    public function test_c14_does_not_report_a_schedule_that_is_simply_too_new_to_have_fired(): void
+    {
+        // THE REGRESSION. This check used to flag ANY schedule with no run rows, so a daily job
+        // registered ninety seconds ago was reported overdue — and because scheduler.doctor gates
+        // deploy:doctor, every release that introduced a schedule reported failures that were not
+        // faults. That is how a check stops being read.
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $schedule = $this->makeSchedule('freshly-registered-daily', trigger: new IntervalTrigger(86400));
+        $this->dynamicStore->seed($schedule);
+        $this->seedFirstSeen($conn, $schedule, 90); // first seen 90 seconds ago
+
+        $report = $this->makeDoctor(conn: $conn)->run();
+        $c14    = $this->findCheck($report->findings, 'C14');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c14->status, 'a brand-new schedule is not overdue');
+    }
+
+    public function test_c14_stays_silent_when_it_cannot_know_how_long_a_schedule_has_existed(): void
+    {
+        // No cursor row at all: the daemon has not scanned this schedule yet, so there is no basis
+        // for a verdict. Guessing "overdue" would be a false alarm and guessing "fine" would be a
+        // false clear; declining is the only honest option for a check meant to be trusted.
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $this->dynamicStore->seed($this->makeSchedule('never-scanned', trigger: new IntervalTrigger(3600)));
+
+        $report = $this->makeDoctor(conn: $conn)->run();
+        $c14    = $this->findCheck($report->findings, 'C14');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c14->status);
     }
 
     public function test_c14_fails_for_a_schedule_that_stopped_dispatching(): void
@@ -214,6 +252,30 @@ final class SchedulerDoctorTest extends TestCase
         self::assertSame(SchedulerDoctorStatus::Pass, $c14->status);
     }
 
+
+    /**
+     * Record that the daemon first saw a schedule $agoSeconds ago.
+     *
+     * C14 needs this to tell a schedule that has never dispatched because it is NEW from one that
+     * has never dispatched because it is BROKEN.
+     */
+    private function seedFirstSeen(
+        \Doctrine\DBAL\Connection $conn,
+        Schedule $schedule,
+        int $agoSeconds,
+    ): void {
+        $at = $this->clock->now()->modify("-{$agoSeconds} seconds");
+
+        $conn->insert('vortos_scheduler_cursors', [
+            'schedule_id'    => $schedule->id->toString(),
+            'tenant_id'      => $schedule->tenantId,
+            'cursor_at'      => $at->format('Y-m-d H:i:s'),
+            'cursor_version' => 1,
+            'updated_at'     => $at->format('Y-m-d H:i:s'),
+            'first_seen_at'  => $at->format('Y-m-d H:i:s'),
+        ]);
+    }
+
     private function insertRun(
         \Doctrine\DBAL\Connection $conn,
         Schedule $schedule,
@@ -244,6 +306,16 @@ final class SchedulerDoctorTest extends TestCase
                 completed_at DATETIME NULL,
                 run_state VARCHAR(20) NOT NULL DEFAULT "dispatched",
                 attempt SMALLINT NOT NULL DEFAULT 1
+            )
+        ');
+        $conn->executeStatement('
+            CREATE TABLE vortos_scheduler_cursors (
+                schedule_id VARCHAR(36) NOT NULL PRIMARY KEY,
+                tenant_id VARCHAR(255) NULL,
+                cursor_at DATETIME NOT NULL,
+                cursor_version INTEGER NOT NULL DEFAULT 1,
+                updated_at DATETIME NOT NULL,
+                first_seen_at DATETIME NULL
             )
         ');
         $conn->executeStatement('
