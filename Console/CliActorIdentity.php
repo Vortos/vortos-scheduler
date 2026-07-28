@@ -22,6 +22,7 @@ final readonly class CliActorIdentity implements UserIdentityInterface
         return $this->actorId;
     }
 
+    /** @return list<string> */
     public function roles(): array
     {
         return [];

@@ -69,8 +69,9 @@ abstract class ScheduleStatusOverrideStoreConformanceTestCase extends TestCase
         $this->store->save(new ScheduleStatusOverride($id, ScheduleStatus::Paused, 'actor-2', 'second', $now->modify('+1 hour')));
 
         $found = $this->store->find($id);
-        self::assertSame('actor-2', $found?->actorId);
-        self::assertSame('second', $found?->reason);
+        self::assertNotNull($found);
+        self::assertSame('actor-2', $found->actorId);
+        self::assertSame('second', $found->reason);
     }
 
     public function test_save_paused_then_active(): void

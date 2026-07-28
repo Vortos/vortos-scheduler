@@ -91,7 +91,7 @@ final class DbalScheduleStatusOverrideStore implements ScheduleStatusOverrideSto
             scheduleId: ScheduleId::fromString((string) $row['schedule_id']),
             status:     ScheduleStatus::from((string) $row['status']),
             actorId:    (string) $row['actor_id'],
-            reason:     isset($row['reason']) && $row['reason'] !== null ? (string) $row['reason'] : null,
+            reason:     isset($row['reason']) ? (string) $row['reason'] : null,
             updatedAt:  new DateTimeImmutable((string) $row['updated_at'], new DateTimeZone('UTC')),
         );
     }

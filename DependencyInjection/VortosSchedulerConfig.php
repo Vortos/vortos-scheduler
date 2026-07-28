@@ -258,7 +258,11 @@ final class VortosSchedulerConfig
     }
 
 
-    /** @internal Used by SchedulerExtension to validate/normalize via Configuration's tree. */
+    /**
+     * @internal Used by SchedulerExtension to validate/normalize via Configuration's tree.
+     *
+     * @return array<string, mixed>
+     */
     public function toArray(): array
     {
         return [

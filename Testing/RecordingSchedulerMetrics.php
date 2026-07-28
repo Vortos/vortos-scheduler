@@ -41,9 +41,11 @@ final class RecordingSchedulerMetrics
         $metricsInterface = new class($self) implements MetricsInterface {
             public function __construct(private RecordingSchedulerMetrics $recording) {}
 
+            /** @param array<string, string> $labels */
             public function counter(string $name, array $labels = []): CounterInterface
             {
                 return new class($this->recording, $name, $labels) implements CounterInterface {
+                    /** @param array<string, string> $labels */
                     public function __construct(
                         private RecordingSchedulerMetrics $recording,
                         private string $name,
@@ -57,9 +59,11 @@ final class RecordingSchedulerMetrics
                 };
             }
 
+            /** @param array<string, string> $labels */
             public function gauge(string $name, array $labels = []): GaugeInterface
             {
                 return new class($this->recording, $name, $labels) implements GaugeInterface {
+                    /** @param array<string, string> $labels */
                     public function __construct(
                         private RecordingSchedulerMetrics $recording,
                         private string $name,
@@ -76,9 +80,11 @@ final class RecordingSchedulerMetrics
                 };
             }
 
+            /** @param array<string, string> $labels */
             public function histogram(string $name, array $labels = []): HistogramInterface
             {
                 return new class($this->recording, $name, $labels) implements HistogramInterface {
+                    /** @param array<string, string> $labels */
                     public function __construct(
                         private RecordingSchedulerMetrics $recording,
                         private string $name,
@@ -107,6 +113,7 @@ final class RecordingSchedulerMetrics
         }
     }
 
+    /** @param array<string, string> $labels */
     public function assertCounterIncrementedWith(string $name, array $labels): void
     {
         foreach ($this->counters as $c) {
@@ -150,6 +157,24 @@ final class RecordingSchedulerMetrics
         if ($this->counters !== [] || $this->histograms !== [] || $this->gauges !== []) {
             throw new \RuntimeException('Expected no metrics to be emitted, but found some.');
         }
+    }
+
+    /**
+     * Every label set recorded against a counter, in order — for assertions about the label VALUE
+     * rather than just the fact that something was counted.
+     *
+     * @return list<array<string, string>>
+     */
+    public function counterLabelsFor(string $name): array
+    {
+        $labels = [];
+        foreach ($this->counters as $c) {
+            if ($c['name'] === $name) {
+                $labels[] = $c['labels'];
+            }
+        }
+
+        return $labels;
     }
 
     public function countFor(string $name): int

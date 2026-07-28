@@ -224,7 +224,7 @@ final class FireQueueConsumer
         $rowId        = (string) $row['id'];
         $runId        = (string) $row['run_id'];
         $scheduleId   = (string) $row['schedule_id'];
-        $tenantId     = isset($row['tenant_id']) && $row['tenant_id'] !== null && $row['tenant_id'] !== ''
+        $tenantId     = isset($row['tenant_id']) && $row['tenant_id'] !== ''
             ? (string) $row['tenant_id']
             : null;
         $slot         = (string) $row['slot'];

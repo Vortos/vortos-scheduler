@@ -80,9 +80,18 @@ final class ScheduleRunNowCommand extends Command
             FireDispatchResult::AlreadyDispatched => '<comment>Already dispatched (idempotent)</comment>',
             FireDispatchResult::SkippedOverlap   => '<comment>Skipped (prior run still in-flight)</comment>',
             FireDispatchResult::Deferred         => '<comment>Deferred (jitter window not elapsed)</comment>',
+            FireDispatchResult::CircuitOpen      => '<error>Skipped (dispatch circuit breaker is open)</error>',
         };
 
         $output->writeln('Result: ' . $resultLabel);
+
+        // An open circuit means nothing ran. Exiting 0 would tell a script or a runbook step that the
+        // manual fire succeeded, so this is the one outcome that is reported as a failure.
+        if ($result === FireDispatchResult::CircuitOpen) {
+            $output->writeln('The breaker reopens once the dispatch backend recovers; retry after that.');
+
+            return Command::FAILURE;
+        }
 
         return Command::SUCCESS;
     }

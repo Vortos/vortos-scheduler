@@ -90,8 +90,9 @@ abstract class RunRetentionOverrideStoreConformanceTestCase extends TestCase
         $this->store->save(new RunRetentionOverride('tenant-3', 90, 'actor-2', $now->modify('+1 hour')));
 
         $found = $this->store->find('tenant-3');
-        self::assertSame(90, $found?->retentionDays);
-        self::assertSame('actor-2', $found?->actorId);
+        self::assertNotNull($found);
+        self::assertSame(90, $found->retentionDays);
+        self::assertSame('actor-2', $found->actorId);
     }
 
     // ── Group C — findAll ─────────────────────────────────────────────────────

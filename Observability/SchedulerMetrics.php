@@ -273,6 +273,7 @@ final class SchedulerMetrics implements SchedulerMetricsPort
             FireDispatchResult::AlreadyDispatched => 'already_dispatched',
             FireDispatchResult::SkippedOverlap    => 'skipped_overlap',
             FireDispatchResult::Deferred          => 'deferred',
+            FireDispatchResult::CircuitOpen       => 'circuit_open',
         };
     }
 

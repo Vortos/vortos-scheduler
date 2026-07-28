@@ -33,7 +33,9 @@ final class InMemorySchedulerAuditCheckpointRepository implements SchedulerAudit
             return null;
         }
 
-        return end($matches) ?: null;
+        // end() would be `?: null`-guarded against a `false` that cannot happen here — and `?:` would
+        // also swallow a legitimately falsy checkpoint if this list ever held anything but objects.
+        return $matches[array_key_last($matches)];
     }
 
     /** @return list<SchedulerAuditCheckpoint> */

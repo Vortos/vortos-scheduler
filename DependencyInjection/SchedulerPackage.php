@@ -15,7 +15,7 @@ use Vortos\Scheduler\DependencyInjection\Compiler\StaticSchedulePass;
 
 final class SchedulerPackage implements PackageInterface
 {
-    public function getContainerExtension(): ?ExtensionInterface
+    public function getContainerExtension(): ExtensionInterface
     {
         return new SchedulerExtension();
     }

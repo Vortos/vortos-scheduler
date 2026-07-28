@@ -21,12 +21,17 @@ use Vortos\Scheduler\Schedule\Schedule;
 #[AsPolicy(resource: 'scheduler')]
 final class SchedulerResourcePolicy implements PolicyInterface
 {
+    /**
+     * Narrower than the interface's `bool|PolicyDecision` on purpose: every path here returns a
+     * PolicyDecision, so callers get the reason string as well as the verdict. Covariant, so it
+     * still satisfies PolicyInterface.
+     */
     public function can(
         AuthorizationContext $auth,
         string $action,
         string $scope,
         mixed $resource = null,
-    ): bool|PolicyDecision {
+    ): PolicyDecision {
         if ($scope === 'own') {
             if (!$resource instanceof Schedule) {
                 return PolicyDecision::deny('resource_missing');

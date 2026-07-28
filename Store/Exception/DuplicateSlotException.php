@@ -24,7 +24,7 @@ final class DuplicateSlotException extends \DomainException
     public function __construct(
         public readonly string     $slot,
         public readonly ScheduleId $scheduleId,
-        \Throwable                 $previous = null,
+        ?\Throwable                $previous = null,
     ) {
         parent::__construct(
             "Slot '{$slot}' for schedule '{$scheduleId->toString()}' was already enqueued " .

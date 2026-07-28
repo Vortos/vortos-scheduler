@@ -101,6 +101,7 @@ final class DeadManDetector
         }
     }
 
+    /** @param array<string, DateTimeImmutable> $lastDispatches keyed by schedule id */
     private function checkSchedule(
         Schedule $schedule,
         DateTimeImmutable $now,

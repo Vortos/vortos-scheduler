@@ -62,7 +62,8 @@ LUA;
         $ttlMs  = $ttlSeconds * 1000;
         $result = $this->redis->set($this->prefixedKey($key), $token->value, ['NX', 'PX' => $ttlMs]);
 
-        if ($result === false || $result === null) {
+        // SET NX returns false when the key already exists — i.e. the lease is held elsewhere.
+        if ($result === false) {
             return null;
         }
 

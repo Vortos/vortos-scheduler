@@ -158,6 +158,7 @@ final class SpySchedulerAuditProjector
         return null;
     }
 
+    /** @param array<string, mixed> $data */
     private function record(SchedulerAuditEvent $event, array $data): void
     {
         $this->recorded[] = ['event' => $event, 'data' => $data];

@@ -136,6 +136,7 @@ final class SchedulerExtension extends Extension
      * same convention as CacheExtension/AuthExtension/CqrsExtension/... throughout this
      * framework: kernel.project_dir and kernel.env are hard requirements, not optional.
      */
+    /** @return array<string, mixed> the processed, validated configuration tree */
     private function loadConfig(ContainerBuilder $container): array
     {
         $projectDir = (string) $container->getParameter('kernel.project_dir');
@@ -156,6 +157,7 @@ final class SchedulerExtension extends Extension
         return $this->processConfiguration(new Configuration(), [$config->toArray()]);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerResolver(ContainerBuilder $container, array $config): void
     {
         // Autoconfigure: any StaticScheduleDefinition impl automatically gets the static_schedule tag.
@@ -199,6 +201,7 @@ final class SchedulerExtension extends Extension
         $container->setAlias(ClockInterface::class, SystemClock::class);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerStores(ContainerBuilder $container, array $config): void
     {
         if (!class_exists(Connection::class)) {
@@ -241,6 +244,7 @@ final class SchedulerExtension extends Extension
         $container->setAlias(ScheduleCursorStoreInterface::class, DbalScheduleCursorStore::class);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerEngine(ContainerBuilder $container, array $config): void
     {
         // Pure engine components — no infrastructure dependencies
@@ -290,6 +294,7 @@ final class SchedulerExtension extends Extension
         $container->setAlias(FireDispatcherPort::class, DispatchCircuitBreaker::class);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerSecurity(ContainerBuilder $container, array $config): void
     {
         $prefix = $container->hasParameter('vortos.db.framework_table_prefix')
@@ -332,6 +337,7 @@ final class SchedulerExtension extends Extension
         $container->setAlias(SchedulePolicyInterface::class, NullSchedulePolicy::class);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerAudit(ContainerBuilder $container, array $config): void
     {
         if (!class_exists(Connection::class)) {
@@ -384,6 +390,7 @@ final class SchedulerExtension extends Extension
         }
     }
 
+    /** @param array<string, mixed> $config */
     private function registerMetrics(ContainerBuilder $container, array $config): void
     {
         // Register metric definitions so MetricDefinitionsCompilerPass picks them up.
@@ -417,6 +424,7 @@ final class SchedulerExtension extends Extension
         $container->setAlias(SchedulerMetricsPort::class, CardinalityGuardedSchedulerMetrics::class);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerObservability(ContainerBuilder $container, array $config): void
     {
         // SchedulerTracer — wraps framework TracingInterface (null = no-op). Same correction as
@@ -443,6 +451,7 @@ final class SchedulerExtension extends Extension
         // See DeadManDetectorPass for the full account.
     }
 
+    /** @param array<string, mixed> $config */
     private function registerDaemon(ContainerBuilder $container, array $config): void
     {
         if (!$container->hasDefinition(FireDispatcher::class)) {
@@ -492,6 +501,7 @@ final class SchedulerExtension extends Extension
         }
     }
 
+    /** @param array<string, mixed> $config */
     private function registerLeaseDrivers(ContainerBuilder $container, array $config): void
     {
         $container->register(InMemoryLeaseStore::class, InMemoryLeaseStore::class)
@@ -556,6 +566,7 @@ final class SchedulerExtension extends Extension
      * its CQRS handler — but only when the resolved retention is non-zero, so a
      * globally-disabled install never registers a schedule that fires and no-ops.
      */
+    /** @param array<string, mixed> $config */
     private function registerRetention(ContainerBuilder $container, array $config): void
     {
         if (!class_exists(Connection::class) || !$container->hasDefinition(FireDispatcher::class)) {
@@ -640,6 +651,7 @@ final class SchedulerExtension extends Extension
      * which read false under MergeExtensionConfigurationPass isolation and dropped the consumer even
      * when the bus was present.
      */
+    /** @param array<string, mixed> $config */
     private function registerConsumer(ContainerBuilder $container, array $config): void
     {
         if (!class_exists(Connection::class) || !interface_exists('Vortos\Cqrs\Command\CommandBusInterface')) {
@@ -728,6 +740,7 @@ final class SchedulerExtension extends Extension
             ->setPublic(true);
     }
 
+    /** @param array<string, mixed> $config */
     private function registerDoctor(ContainerBuilder $container, array $config): void
     {
         if (!$container->hasDefinition(ScheduleResolver::class)) {

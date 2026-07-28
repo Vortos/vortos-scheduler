@@ -19,6 +19,7 @@ final class FakeUserIdentity implements UserIdentityInterface
         return $this->userId;
     }
 
+    /** @return list<string> */
     public function roles(): array
     {
         return [];
