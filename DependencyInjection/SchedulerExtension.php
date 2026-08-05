@@ -11,6 +11,7 @@ use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Reference;
+use Vortos\Foundation\Reset\ServicesResetter;
 use Vortos\Cache\Adapter\RedisConnectionFactory;
 use Vortos\Metrics\Contract\MetricsInterface;
 use Vortos\Metrics\Definition\MetricDefinitionProviderInterface;
@@ -688,6 +689,12 @@ final class SchedulerExtension extends Extension
             ->setArgument('$maxAttempts', $config['fire_max_attempts'])
             ->setArgument('$backoffBaseSec', $config['fire_backoff_base_sec'])
             ->setArgument('$backoffCapSec', $config['fire_backoff_cap_sec'])
+            // Resets per-request-scoped services between fires, the way Runner does
+            // between HTTP requests. Without it a long-lived scheduler:consume worker
+            // accumulates the Doctrine identity map and memoised feature flags for its
+            // whole life. NULL_ON_INVALID_REFERENCE so a container without Foundation's
+            // resetter still boots.
+            ->setArgument('$servicesResetter', new Reference(ServicesResetter::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
             ->setPublic(false);
 
         $container->register(SchedulerConsumeCommand::class, SchedulerConsumeCommand::class)

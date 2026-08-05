@@ -9,6 +9,7 @@ use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+use Vortos\Foundation\Reset\ServicesResetter;
 use Vortos\Cqrs\Command\CommandBusInterface;
 use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Fire\RunState;
@@ -63,6 +64,11 @@ final class FireQueueConsumer
         private readonly int                        $maxAttempts = 10,
         private readonly int                        $backoffBaseSec = 2,
         private readonly int                        $backoffCapSec = 300,
+        /**
+         * Resets per-request-scoped services between fires. Optional so a minimal
+         * container can construct this without one; wired in production.
+         */
+        private readonly ?ServicesResetter          $servicesResetter = null,
     ) {}
 
     /**
@@ -221,6 +227,15 @@ final class FireQueueConsumer
      */
     private function processRow(array $row, ?array $capabilities): void
     {
+        // Each fire is its own unit of work, so it starts from the same clean state an
+        // HTTP request does via Runner::cleanUp(). `scheduler:consume` is a single
+        // long-lived command, so without this the Doctrine identity map accumulates for
+        // the life of the worker and a scheduled command reads aggregates as they looked
+        // when an earlier fire ran. Feature flags are the other casualty: FlagRegistry
+        // memoises resolutions per request, so a kill switch flipped in the console would
+        // not reach a running scheduler worker until it was restarted.
+        $this->servicesResetter?->reset();
+
         $rowId        = (string) $row['id'];
         $runId        = (string) $row['run_id'];
         $scheduleId   = (string) $row['schedule_id'];

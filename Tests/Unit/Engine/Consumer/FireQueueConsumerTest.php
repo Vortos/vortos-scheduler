@@ -14,6 +14,9 @@ use Vortos\Domain\Command\CommandInterface;
 use Vortos\Scheduler\Clock\MutableClock;
 use Vortos\Scheduler\Engine\Consumer\ConsumerCapabilityResolverInterface;
 use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
+use Psr\Container\ContainerInterface as PsrContainerInterface;
+use Symfony\Contracts\Service\ResetInterface;
+use Vortos\Foundation\Reset\ServicesResetter;
 use Vortos\Scheduler\Fire\CommandHydrator;
 use Vortos\Scheduler\Fire\RunState;
 use Vortos\Scheduler\Fire\ScheduleRun;
@@ -276,6 +279,7 @@ final class FireQueueConsumerTest extends TestCase
     private function makeConsumer(
         ?ConsumerCapabilityResolverInterface $capabilityResolver = null,
         int $maxAttempts = 10,
+        ?ServicesResetter $servicesResetter = null,
     ): FireQueueConsumer {
         return new FireQueueConsumer(
             connection: $this->connection,
@@ -288,7 +292,39 @@ final class FireQueueConsumerTest extends TestCase
             table:      self::TABLE,
             capabilityResolver: $capabilityResolver,
             maxAttempts: $maxAttempts,
+            servicesResetter: $servicesResetter,
         );
+    }
+
+    /**
+     * `scheduler:consume` is a single long-lived command, so nothing resets per-request
+     * services for it the way Runner::cleanUp() does after an HTTP request. Without this
+     * the Doctrine identity map accumulates for the life of the worker — a scheduled
+     * command then reads aggregates as an earlier fire left them — and FlagRegistry keeps
+     * its memoised resolutions, so a kill switch flipped in the console never reaches a
+     * running worker.
+     */
+    public function test_resets_per_request_services_before_each_fire(): void
+    {
+        $resettable = new class implements ResetInterface {
+            public int $resets = 0;
+            public function reset(): void { $this->resets++; }
+        };
+
+        $container = new class($resettable) implements PsrContainerInterface {
+            public function __construct(private object $svc) {}
+            public function get(string $id): mixed { return $this->svc; }
+            public function has(string $id): bool { return true; }
+        };
+
+        $this->insertRow('run-1', FixtureConsumeCommand::class);
+        $this->insertRow('run-2', FixtureConsumeCommand::class);
+
+        $this->makeConsumer(
+            servicesResetter: new ServicesResetter($container, ['some.resettable']),
+        )->consumeBatch(10);
+
+        self::assertSame(2, $resettable->resets, 'every fire must start from clean per-request state');
     }
 }
 
