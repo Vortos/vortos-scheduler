@@ -6,10 +6,12 @@ namespace Vortos\Scheduler\DependencyInjection\Compiler;
 
 use Psr\Log\LoggerInterface;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Reference;
 use Vortos\Scheduler\Clock\ClockPort;
 use Vortos\Scheduler\Observability\DeadManDetector;
+use Vortos\Scheduler\Store\ScheduleCursorStoreInterface;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 
 /**
@@ -69,6 +71,14 @@ final class DeadManDetectorPass implements CompilerPassInterface
                 ? $container->getParameter('vortos_scheduler.dead_man_tolerance_sec')
                 : 300)
             ->setArgument('$logger',              new Reference(LoggerInterface::class))
+            // Supplies the first-seen baseline that separates "never fired because it is new" from
+            // "never fired because it is broken". NULL_ON_INVALID_REFERENCE rather than a hard
+            // dependency: without it the detector still runs, and reports that distinction as
+            // Indeterminate instead of guessing.
+            ->setArgument('$cursors',             new Reference(
+                ScheduleCursorStoreInterface::class,
+                ContainerInterface::NULL_ON_INVALID_REFERENCE,
+            ))
             ->setPublic(false);
     }
 }

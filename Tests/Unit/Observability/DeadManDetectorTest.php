@@ -23,8 +23,11 @@ use Vortos\Scheduler\Schedule\Schedule;
 use Vortos\Scheduler\Schedule\ScheduleId;
 use Vortos\Scheduler\Schedule\ScheduleSource;
 use Vortos\Scheduler\Schedule\ScheduleStatus;
+use Vortos\Scheduler\Schedule\Trigger\RecurringTrigger;
 use Vortos\Scheduler\Schedule\Trigger\Trigger;
+use Vortos\Scheduler\Store\CadenceCursor;
 use Vortos\Scheduler\Store\PruneResult;
+use Vortos\Scheduler\Store\ScheduleCursorStoreInterface;
 use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
 use Vortos\Scheduler\Tests\Unit\Security\Support\StubAllowlistedCommand;
 
@@ -98,20 +101,204 @@ final class DeadManDetectorTest extends TestCase
         self::assertCount(0, $dispatcher->dispatched());
     }
 
-    // ── Alert-raising scenarios ───────────────────────────────────────────────
+    // ── Healthy schedules must be silent ──────────────────────────────────────
 
-    public function test_schedule_never_fired_raises_critical_alert(): void
+    /**
+     * A working schedule produces silence — the question this suite never asked.
+     *
+     * Every pre-existing case drove the detector with a stub trigger written to look overdue, so it
+     * only ever established "it alerts when told to". This one uses a real daily cron with the
+     * shipped default tolerance and no per-schedule override.
+     *
+     * In fairness to the old code, this exact case passed there too: a schedule with dispatch
+     * history inside a two-year window looks healthy however badly the window is sized. The bugs
+     * lived either side of it — a schedule with NO history yet
+     * ({@see test_a_newly_registered_schedule_is_silent}) and a schedule that genuinely stopped
+     * ({@see test_a_daily_schedule_that_stopped_days_ago_pages}), both of which the old code got
+     * wrong. This test is the baseline the other two are read against.
+     */
+    public function test_a_healthy_daily_schedule_is_silent(): void
     {
-        $trigger    = $this->makePastDueTrigger();
         $dispatcher = new SpyAlertDispatcher();
-        // No runs in store: all schedule IDs return null
-        $detector = $this->makeDetector($dispatcher, []);
-        $schedule = $this->makeSchedule(trigger: $trigger, metadata: ['deadman_tolerance_sec' => (string) self::TOLERANCE]);
+        $schedule   = $this->makeSchedule(name: 'applicant-notifications-full-sweep', trigger: $this->makeDailyTrigger('00:10'));
+
+        // Fired on schedule this morning, and first seen weeks ago.
+        $detector = $this->makeDetector(
+            $dispatcher,
+            [$schedule->id->toString() => $this->now->modify('-9 hours 50 minutes')],
+            [$schedule->id->toString() => $this->now->modify('-21 days')],
+        );
+
+        $detector->check([$schedule]);
+
+        self::assertSame([], $dispatcher->dispatched());
+    }
+
+    /** The same schedule, actually dead: silence for days must still page. */
+    public function test_a_daily_schedule_that_stopped_days_ago_pages(): void
+    {
+        $dispatcher = new SpyAlertDispatcher();
+        $schedule   = $this->makeSchedule(name: 'applicant-notifications-full-sweep', trigger: $this->makeDailyTrigger('00:10'));
+
+        $detector = $this->makeDetector(
+            $dispatcher,
+            [$schedule->id->toString() => $this->now->modify('-6 days')],
+            [$schedule->id->toString() => $this->now->modify('-21 days')],
+        );
 
         $detector->check([$schedule]);
 
         self::assertCount(1, $dispatcher->dispatched());
         self::assertSame(Severity::Critical, $dispatcher->dispatched()[0]->severity);
+        self::assertSame('overdue', $dispatcher->dispatched()[0]->labels['verdict']);
+    }
+
+    /**
+     * The tolerance a daily schedule gets must be about two days, not two years.
+     *
+     * The old period calculation measured `nextRunAfter(now) - nextRunAfter(now - 1 year)` and got
+     * ~1 year for everything, so every schedule was handed a ~730-day window — long enough that a
+     * dead daily job would not have paged until 2028. The assertion is on the tolerance the alert
+     * reports, because that number is what was visibly wrong in production.
+     */
+    public function test_a_daily_schedule_gets_a_two_day_tolerance_not_two_years(): void
+    {
+        $dispatcher = new SpyAlertDispatcher();
+        $schedule   = $this->makeSchedule(trigger: $this->makeDailyTrigger('00:10'));
+
+        $detector = $this->makeDetector(
+            $dispatcher,
+            [$schedule->id->toString() => $this->now->modify('-30 days')],
+            [$schedule->id->toString() => $this->now->modify('-60 days')],
+        );
+
+        $detector->check([$schedule]);
+
+        self::assertCount(1, $dispatcher->dispatched());
+        self::assertSame('172800', $dispatcher->dispatched()[0]->annotations['tolerance_sec']);
+    }
+
+    /**
+     * A weekday-only cron must be sized off its longest gap, not its shortest.
+     *
+     * Sizing off Tuesday-to-Wednesday gives a two-day window, and the weekend is three days wide —
+     * so the schedule would page every Monday morning having done nothing wrong.
+     */
+    public function test_an_unevenly_spaced_schedule_is_sized_off_its_longest_gap(): void
+    {
+        $dispatcher = new SpyAlertDispatcher();
+        // Fires 09:00 on weekdays only; "now" is a Wednesday, so the sampled slots span a weekend.
+        $schedule = $this->makeSchedule(trigger: $this->makeWeekdayTrigger('09:00'));
+
+        $detector = $this->makeDetector(
+            $dispatcher,
+            [$schedule->id->toString() => $this->now->modify('-30 days')],
+            [$schedule->id->toString() => $this->now->modify('-60 days')],
+        );
+
+        $detector->check([$schedule]);
+
+        self::assertCount(1, $dispatcher->dispatched());
+        self::assertSame(
+            (string) (3 * 86400 * 2),
+            $dispatcher->dispatched()[0]->annotations['tolerance_sec'],
+            'The window must cover the weekend gap, doubled — not the weekday gap.',
+        );
+    }
+
+    // ── Alert-raising scenarios ───────────────────────────────────────────────
+
+    /**
+     * A schedule with no runs that has been known for longer than its tolerance really has never
+     * fired, and that is an outage.
+     *
+     * The first-seen baseline is what makes this callable at all. Without it, "no runs" is the same
+     * observation for a schedule registered a minute ago, and calling that dead is what produced
+     * false Criticals for every schedule the last two deployments introduced.
+     */
+    public function test_schedule_that_has_never_fired_since_first_seen_raises_critical(): void
+    {
+        $trigger    = $this->makePastDueTrigger();
+        $dispatcher = new SpyAlertDispatcher();
+        $schedule   = $this->makeSchedule(trigger: $trigger, metadata: ['deadman_tolerance_sec' => (string) self::TOLERANCE]);
+
+        // Known about for far longer than the tolerance window, and still nothing in the ledger.
+        $detector = $this->makeDetector($dispatcher, [], [
+            $schedule->id->toString() => $this->now->modify('-30 days'),
+        ]);
+
+        $detector->check([$schedule]);
+
+        self::assertCount(1, $dispatcher->dispatched());
+        self::assertSame(Severity::Critical, $dispatcher->dispatched()[0]->severity);
+        self::assertSame('never_fired', $dispatcher->dispatched()[0]->labels['verdict']);
+    }
+
+    /** No baseline to judge against is a monitoring gap, and says so — as a Warning, not a page. */
+    public function test_schedule_with_no_first_seen_baseline_is_indeterminate(): void
+    {
+        $dispatcher = new SpyAlertDispatcher();
+        $schedule   = $this->makeSchedule(
+            trigger:  $this->makePastDueTrigger(),
+            metadata: ['deadman_tolerance_sec' => (string) self::TOLERANCE],
+        );
+
+        $this->makeDetector($dispatcher, [])->check([$schedule]);
+
+        self::assertCount(1, $dispatcher->dispatched());
+        self::assertSame(Severity::Warning, $dispatcher->dispatched()[0]->severity);
+        self::assertSame('indeterminate', $dispatcher->dispatched()[0]->labels['verdict']);
+    }
+
+    /**
+     * The false positive that started this. A schedule registered moments ago has no runs and is
+     * completely healthy; it must not alert, at any severity.
+     */
+    public function test_a_newly_registered_schedule_is_silent(): void
+    {
+        $dispatcher = new SpyAlertDispatcher();
+        $schedule   = $this->makeSchedule(
+            trigger:  $this->makePastDueTrigger(),
+            metadata: ['deadman_tolerance_sec' => (string) self::TOLERANCE],
+        );
+
+        $detector = $this->makeDetector($dispatcher, [], [
+            $schedule->id->toString() => $this->now->modify('-60 seconds'),
+        ]);
+
+        $detector->check([$schedule]);
+
+        self::assertSame([], $dispatcher->dispatched());
+    }
+
+    /** An unreadable run ledger leaves every schedule unmonitored, and must not pass as silence. */
+    public function test_unreadable_run_ledger_raises_one_warning(): void
+    {
+        $runStore = new class implements ScheduleRunStoreInterface {
+            public function findLastDispatchTimes(array $scheduleIds, ?string $tenantId): array
+            {
+                throw new \RuntimeException('DB gone');
+            }
+
+            public function insertRun(\Vortos\Scheduler\Fire\ScheduleRun $run): void {}
+            public function findLastSlots(array $scheduleIds, ?string $tenantId): array { return []; }
+            public function findRunState(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\RunState { return null; }
+            public function findRunBySlot(\Vortos\Scheduler\Schedule\ScheduleId $scheduleId, string $slot, ?string $tenantId): ?\Vortos\Scheduler\Fire\ScheduleRun { return null; }
+            public function transitionRunState(string $runId, \Vortos\Scheduler\Fire\RunState $newState, \DateTimeImmutable $at): void {}
+            public function pruneOldRuns(\DateTimeImmutable $olderThan, ?string $tenantId = null, array $excludeTenantIds = []): PruneResult { return new PruneResult(0, false); }
+        };
+
+        $dispatcher = new SpyAlertDispatcher();
+        $detector   = new DeadManDetector($runStore, $dispatcher, $this->clock, self::ENV, self::TOLERANCE);
+
+        $detector->check([
+            $this->makeSchedule(trigger: $this->makePastDueTrigger()),
+            $this->makeSchedule(trigger: $this->makePastDueTrigger()),
+        ]);
+
+        self::assertCount(1, $dispatcher->dispatched(), 'One alert for the node, not one per schedule.');
+        self::assertSame(Severity::Warning, $dispatcher->dispatched()[0]->severity);
+        self::assertStringContainsString('cannot read dispatch history', $dispatcher->dispatched()[0]->title);
     }
 
     public function test_alert_source_is_scheduler(): void
@@ -270,7 +457,10 @@ final class DeadManDetectorTest extends TestCase
         // Must NOT throw
         $detector->check([$schedule]);
 
-        self::assertCount(0, $dispatcher->dispatched());
+        // The failure is now reported rather than swallowed into silence — see
+        // test_unreadable_run_ledger_raises_one_warning. What matters here is that the daemon tick
+        // survives it.
+        self::assertCount(1, $dispatcher->dispatched());
     }
 
     public function test_broken_alert_dispatcher_is_swallowed(): void
@@ -328,6 +518,28 @@ final class DeadManDetectorTest extends TestCase
         });
     }
 
+    /**
+     * Real cron triggers, not stubs.
+     *
+     * The stubbed triggers below exist to force specific branches, but they also mean the period
+     * calculation was only ever exercised against a closure written to satisfy it. The defect being
+     * fixed here lived entirely in that calculation, so the cases that matter drive the actual cron
+     * implementation the daemon uses.
+     */
+    private function makeDailyTrigger(string $hhmm): Trigger
+    {
+        [$hour, $minute] = array_map('intval', explode(':', $hhmm));
+
+        return new RecurringTrigger(sprintf('%d %d * * *', $minute, $hour), new DateTimeZone('UTC'));
+    }
+
+    private function makeWeekdayTrigger(string $hhmm): Trigger
+    {
+        [$hour, $minute] = array_map('intval', explode(':', $hhmm));
+
+        return new RecurringTrigger(sprintf('%d %d * * 1-5', $minute, $hour), new DateTimeZone('UTC'));
+    }
+
     private function makeTrigger(\Closure $resolver): Trigger
     {
         return new class($resolver) implements Trigger {
@@ -342,9 +554,14 @@ final class DeadManDetectorTest extends TestCase
         };
     }
 
+    /**
+     * @param array<string, DateTimeImmutable>      $lastDispatchMap
+     * @param array<string, DateTimeImmutable>|null $firstSeenMap null means no cursor store at all
+     */
     private function makeDetector(
         AlertDispatcherInterface $dispatcher,
         array $lastDispatchMap,
+        ?array $firstSeenMap = null,
     ): DeadManDetector {
         $runStore = $this->makeRunStore($lastDispatchMap);
 
@@ -355,7 +572,39 @@ final class DeadManDetectorTest extends TestCase
             self::ENV,
             self::TOLERANCE,
             new NullLogger(),
+            $firstSeenMap === null ? null : $this->makeCursorStore($firstSeenMap),
         );
+    }
+
+    /** @param array<string, DateTimeImmutable> $firstSeenMap */
+    private function makeCursorStore(array $firstSeenMap): ScheduleCursorStoreInterface
+    {
+        return new class($firstSeenMap, $this->now) implements ScheduleCursorStoreInterface {
+            /** @param array<string, DateTimeImmutable> $firstSeenMap */
+            public function __construct(
+                private array $firstSeenMap,
+                private DateTimeImmutable $now,
+            ) {}
+
+            public function findCursors(array $scheduleIds, ?string $tenantId): array
+            {
+                $out = [];
+                foreach ($scheduleIds as $id) {
+                    $key = $id->toString();
+                    if (!isset($this->firstSeenMap[$key])) {
+                        continue; // No cursor row: the schedule has never been scanned.
+                    }
+                    $out[$key] = new CadenceCursor($id, $tenantId, $this->now, 1, $this->firstSeenMap[$key]);
+                }
+
+                return $out;
+            }
+
+            public function advance(ScheduleId $id, ?string $tenantId, DateTimeImmutable $newCursor, int $expectedVersion): bool
+            {
+                return true;
+            }
+        };
     }
 
     private function makeRunStore(array $lastDispatchMap): ScheduleRunStoreInterface
