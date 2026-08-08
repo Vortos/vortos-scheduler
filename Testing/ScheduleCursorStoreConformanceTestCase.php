@@ -53,6 +53,53 @@ abstract class ScheduleCursorStoreConformanceTestCase extends TestCase
         self::assertSame('ta', $cursor->tenantId);
     }
 
+    /**
+     * first_seen_at must be recorded on the insert that first anchors a schedule.
+     *
+     * Not bookkeeping: the overdue check reads this to tell a schedule that has never dispatched
+     * because it is NEW from one that has never dispatched because it is BROKEN. Nothing in this
+     * suite covered it, and under that gap the in-memory driver never populated it at all while the
+     * DBAL driver did — two drivers disagreeing about a field an alarm depends on.
+     */
+    public function test_advance_records_first_seen_on_insert(): void
+    {
+        $store = $this->createStore();
+        $id    = ScheduleId::generate();
+
+        self::assertTrue($store->advance($id, 'ta', $this->utc('2026-07-01T10:00:00Z'), 0));
+
+        $cursor = $store->findCursors([$id], null)[$id->toString()];
+        self::assertNotNull($cursor->firstSeenAt, 'A freshly anchored cursor must record when it was first seen.');
+    }
+
+    /**
+     * first_seen_at survives an advance.
+     *
+     * Preserved-once-set is the point: it records first sight, not last movement, so advancing the
+     * cursor must never push it forward — that would keep resetting the baseline and no schedule
+     * would ever look old enough to be judged dead.
+     */
+    public function test_advance_preserves_first_seen_across_updates(): void
+    {
+        $store = $this->createStore();
+        $id    = ScheduleId::generate();
+
+        self::assertTrue($store->advance($id, 'ta', $this->utc('2026-07-01T10:00:00Z'), 0));
+        $first = $store->findCursors([$id], null)[$id->toString()]->firstSeenAt;
+        self::assertNotNull($first);
+
+        self::assertTrue($store->advance($id, 'ta', $this->utc('2026-07-01T11:00:00Z'), 1));
+        $after = $store->findCursors([$id], null)[$id->toString()];
+
+        self::assertNotNull($after->firstSeenAt);
+        self::assertSame(
+            $first->getTimestamp(),
+            $after->firstSeenAt->getTimestamp(),
+            'first_seen_at records first sight and must not advance with the cursor.',
+        );
+        self::assertEquals($this->utc('2026-07-01T11:00:00Z'), $after->cursorAt, 'The cursor itself must still move.');
+    }
+
     public function test_advance_insert_lost_race_returns_false_when_already_present(): void
     {
         $store = $this->createStore();

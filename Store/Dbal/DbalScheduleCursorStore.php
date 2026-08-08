@@ -103,10 +103,23 @@ final class DbalScheduleCursorStore implements ScheduleCursorStoreInterface
             "UPDATE {$this->table}
              SET    cursor_at      = ?,
                     cursor_version = cursor_version + 1,
-                    updated_at     = ?
+                    updated_at     = ?,
+                    -- COALESCE, so an instant already recorded is never overwritten: this field is
+                    -- when the schedule was first seen, not when it last moved. It is set here as
+                    -- well as on insert because rows written before the column existed hold NULL,
+                    -- and NULL is unjudgeable — the overdue check declines to rule on it, which is
+                    -- correct but permanent if nothing ever fills it in. The column's own migration
+                    -- promises that the state becomes known the moment that schedule's cursor is
+                    -- next written; nothing kept that promise, and in production 17 of 27 cursors
+                    -- sat unjudgeable indefinitely as a result.
+                    --
+                    -- Backfilling to now understates the age of a schedule that has existed longer,
+                    -- and that is the safe direction: a younger baseline only makes the dead-man
+                    -- wait longer before declaring a schedule dead. It cannot manufacture a page.
+                    first_seen_at  = COALESCE(first_seen_at, ?)
              WHERE  schedule_id    = ?
                AND  cursor_version = ?",
-            [$cursorAt, $now, $id->toString(), $expectedVersion],
+            [$cursorAt, $now, $now, $id->toString(), $expectedVersion],
         );
 
         return $affected === 1;

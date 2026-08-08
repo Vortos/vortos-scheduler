@@ -48,11 +48,13 @@ final class InMemoryScheduleCursorStore implements ScheduleCursorStoreInterface
     ): bool {
         $existing = $this->cursors[$id->toString()] ?? null;
 
+        $now = new DateTimeImmutable('now');
+
         if ($expectedVersion === 0) {
             if ($existing !== null) {
                 return false; // lost race — already inserted
             }
-            $this->cursors[$id->toString()] = new CadenceCursor($id, $tenantId, $newCursor, 1);
+            $this->cursors[$id->toString()] = new CadenceCursor($id, $tenantId, $newCursor, 1, $now);
 
             return true;
         }
@@ -61,7 +63,17 @@ final class InMemoryScheduleCursorStore implements ScheduleCursorStoreInterface
             return false;
         }
 
-        $this->cursors[$id->toString()] = new CadenceCursor($id, $tenantId, $newCursor, $existing->version + 1);
+        $this->cursors[$id->toString()] = new CadenceCursor(
+            $id,
+            $tenantId,
+            $newCursor,
+            $existing->version + 1,
+            // Mirrors the DBAL driver's COALESCE: preserved once set, filled in when it was never
+            // recorded. This double left it null on every path, which is the divergence that let the
+            // driver's own gap go unnoticed — the overdue check reads this field, and a permanently
+            // null one is permanently unjudgeable.
+            $existing->firstSeenAt ?? $now,
+        );
 
         return true;
     }
