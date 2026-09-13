@@ -14,8 +14,13 @@ use Vortos\Migration\Schema\AbstractModuleSchemaProvider;
  * completion left its rows in `processing` permanently: no retry, no terminal state for the prune to
  * collect, and no signal anywhere.
  *
- * Expand-only: one nullable column and one index. Rows claimed before the column existed carry NULL,
- * and the consumer falls back to `created_at` for them.
+ * Expand-only: one nullable column, no index. Rows claimed before the column existed carry NULL, and the
+ * consumer falls back to `created_at` for them.
+ *
+ * Deliberately NO index. An earlier draft added (status, claimed_at), and the migration safety gate
+ * rejected it: a plain CREATE INDEX takes an exclusive lock on a table every scheduled fire writes to.
+ * It was not needed anyway — the stranded-row probe filters `status = 'processing'`, a handful of rows
+ * by construction, which the existing idx_sched_fq_status_created (status, created_at) already narrows.
  */
 return new class extends AbstractModuleSchemaProvider {
     public function module(): string
@@ -43,11 +48,6 @@ return new class extends AbstractModuleSchemaProvider {
 
         if (!$table->hasColumn('claimed_at')) {
             $table->addColumn('claimed_at', 'datetime_immutable', ['notnull' => false]);
-        }
-
-        // Stranded-row probe: processing rows by claim age.
-        if (!$table->hasIndex('idx_sched_fq_processing_claimed')) {
-            $table->addIndex(['status', 'claimed_at'], 'idx_sched_fq_processing_claimed');
         }
     }
 };
