@@ -110,6 +110,68 @@ final class SchedulerCadenceCursorRegressionTest extends TestCase
         self::assertSame(2, $cursor->version, 'a settled dispatch CAS-advances the cursor version');
     }
 
+    // ── FB-61: a cursor already at its target is not rewritten ───────────────────
+
+    public function test_a_cursor_already_at_its_target_is_not_rewritten_every_tick(): void
+    {
+        // Daily cadence, nothing due. Before the guard every tick bumped the version and updated_at
+        // of every schedule in the shard, so the database was never idle for a full minute.
+        $schedule = $this->makeSchedule(new IntervalTrigger(86400), MisfirePolicy::skipMissed());
+        $this->store->seed($schedule);
+        $daemon = $this->makeDaemon();
+
+        $daemon->runOnce(); // anchors the cursor — one legitimate write
+        self::assertSame(1, $this->cursors->writes);
+
+        for ($i = 0; $i < 10; $i++) {
+            $this->clock->advanceSeconds(60);
+            $daemon->runOnce();
+        }
+
+        $cursor = $this->cursors->findCursors([$schedule->id], null)[$schedule->id->toString()];
+        self::assertSame(0, $this->dispatcher->callCount());
+        self::assertSame(1, $cursor->version, 'an unchanged cursor must not be CAS-bumped');
+        self::assertSame(1, $this->cursors->writes, 'ten idle ticks must write nothing');
+    }
+
+    public function test_an_unchanged_cursor_with_no_first_seen_instant_is_still_written_to_backfill_it(): void
+    {
+        // Rows predating first_seen_at hold NULL, and the advance is the only thing that fills it.
+        // Skipping them as no-ops would leave the dead-man check unable to judge them for ever.
+        $schedule = $this->makeSchedule(new IntervalTrigger(86400), MisfirePolicy::skipMissed());
+        $this->store->seed($schedule);
+        $daemon = $this->makeDaemon();
+        $daemon->runOnce();
+        $anchored = $this->cursors->findCursors([$schedule->id], null)[$schedule->id->toString()];
+        $this->cursors->seed($schedule->id, null, $anchored->cursorAt, $anchored->version, firstSeenAt: null);
+        $this->cursors->writes = 0;
+
+        $daemon->runOnce();
+
+        $cursor = $this->cursors->findCursors([$schedule->id], null)[$schedule->id->toString()];
+        self::assertNotNull($cursor->firstSeenAt);
+        self::assertSame(1, $this->cursors->writes);
+
+        $daemon->runOnce();
+        self::assertSame(1, $this->cursors->writes, 'once backfilled, it is skipped like any other no-op');
+    }
+
+    public function test_a_cursor_that_moves_is_still_advanced(): void
+    {
+        $schedule = $this->makeSchedule(new IntervalTrigger(60), MisfirePolicy::skipMissed());
+        $this->store->seed($schedule);
+        $daemon = $this->makeDaemon();
+        $daemon->runOnce();
+
+        $this->clock->advanceSeconds(60);
+        $daemon->runOnce();
+
+        $cursor = $this->cursors->findCursors([$schedule->id], null)[$schedule->id->toString()];
+        self::assertSame(1, $this->dispatcher->callCount());
+        self::assertEquals($this->clock->now(), $cursor->cursorAt);
+        self::assertSame(2, $cursor->version);
+    }
+
     // ── Bug B: cadence is decoupled from the execution log (run-now cannot poison it) ─
 
     public function test_bug_b_cadence_derives_only_from_cursor_store_not_runs(): void

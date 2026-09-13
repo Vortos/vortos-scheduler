@@ -588,7 +588,22 @@ final class SchedulerDaemon
                 continue;
             }
 
-            $expectedVersion = isset($currentCursors[$sid]) ? $currentCursors[$sid]->version : 0;
+            $current = $currentCursors[$sid] ?? null;
+
+            // A cursor already at its target has nothing to settle. Writing it anyway bumps the
+            // version and updated_at of every schedule in the shard on every tick — a daily
+            // schedule rewritten 1,440 times a day — which keeps the database from ever being idle
+            // for a full minute and turns archive_timeout into a forced WAL switch every minute.
+            // Compared at whole seconds because that is the precision the cursor is stored at.
+            // A row with no first-seen instant is still written: the advance is what backfills it.
+            if ($current !== null
+                && $current->firstSeenAt !== null
+                && $current->cursorAt->getTimestamp() === $target->getTimestamp()
+            ) {
+                continue;
+            }
+
+            $expectedVersion = $current !== null ? $current->version : 0;
 
             $advanced = $this->cursorStore->advance(
                 $schedule->id,

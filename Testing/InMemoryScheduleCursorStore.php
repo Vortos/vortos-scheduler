@@ -18,9 +18,17 @@ final class InMemoryScheduleCursorStore implements ScheduleCursorStoreInterface
     /** @var array<string, CadenceCursor> keyed by scheduleId */
     private array $cursors = [];
 
-    public function seed(ScheduleId $id, ?string $tenantId, DateTimeImmutable $cursorAt, int $version = 1): void
-    {
-        $this->cursors[$id->toString()] = new CadenceCursor($id, $tenantId, $cursorAt, $version);
+    /** Number of advance() calls that changed a row — lets a test prove a no-op was never written. */
+    public int $writes = 0;
+
+    public function seed(
+        ScheduleId         $id,
+        ?string            $tenantId,
+        DateTimeImmutable  $cursorAt,
+        int                $version = 1,
+        ?DateTimeImmutable $firstSeenAt = null,
+    ): void {
+        $this->cursors[$id->toString()] = new CadenceCursor($id, $tenantId, $cursorAt, $version, $firstSeenAt);
     }
 
     public function findCursors(array $scheduleIds, ?string $tenantId): array
@@ -55,6 +63,7 @@ final class InMemoryScheduleCursorStore implements ScheduleCursorStoreInterface
                 return false; // lost race — already inserted
             }
             $this->cursors[$id->toString()] = new CadenceCursor($id, $tenantId, $newCursor, 1, $now);
+            $this->writes++;
 
             return true;
         }
@@ -74,6 +83,7 @@ final class InMemoryScheduleCursorStore implements ScheduleCursorStoreInterface
             // null one is permanently unjudgeable.
             $existing->firstSeenAt ?? $now,
         );
+        $this->writes++;
 
         return true;
     }
