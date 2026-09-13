@@ -751,6 +751,10 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             return new SchedulerDoctorFinding('C15', SchedulerDoctorStatus::Pass, 'No fires abandoned mid-dispatch.');
         }
 
+        // Runtime state, so it must not gate a deploy (gatesDeploy: false), for the reason C14 does not:
+        // the consumer that reclaims stranded fires ships WITH the release. The first release carrying
+        // this check was refused by it — 52 fires stranded by the old consumer, reclaimable only by the
+        // new one the gate would not install. Loud here and in the deploy log; never a veto.
         return new SchedulerDoctorFinding(
             'C15',
             SchedulerDoctorStatus::Fail,
@@ -759,6 +763,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             'A fire-queue consumer exited mid-dispatch (memory_limit fatal, OOM kill, or SIGKILL) and nothing '
             . 'has reclaimed the rows. Check that scheduler:consume --loop is running on a release with the '
             . 'claim lease, and read its logs for the fatal.',
+            gatesDeploy: false,
         );
     }
 

@@ -900,6 +900,9 @@ final class SchedulerDoctorTest extends TestCase
         self::assertStringContainsString('1 fire(s)', $c15->summary);
         self::assertStringContainsString('2026-07-01 00:32:42', $c15->detail);
         self::assertStringContainsString('scheduler:consume', $c15->remediation);
+        // Runtime state: the release that reclaims stranded fires must not be vetoed by the check that
+        // reports them. The first release carrying C15 was blocked exactly that way.
+        self::assertFalse($c15->isDeployBlockingFailure());
     }
 
     public function test_c15_judges_a_legacy_claim_without_claimed_at_by_its_created_at(): void
