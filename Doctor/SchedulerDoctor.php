@@ -141,8 +141,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($failures !== []) {
-            return new SchedulerDoctorFinding(
-                'C1',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C1,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d schedule(s) have invalid trigger expressions.', count($failures)),
                 implode("\n", $failures),
@@ -150,7 +149,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C1', SchedulerDoctorStatus::Pass, 'All trigger expressions are valid.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C1, SchedulerDoctorStatus::Pass, 'All trigger expressions are valid.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -190,8 +189,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($collisions !== []) {
-            return new SchedulerDoctorFinding(
-                'C2',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C2,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d schedule name/ID collision(s) detected.', count($collisions)),
                 implode("\n", $collisions),
@@ -199,7 +197,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C2', SchedulerDoctorStatus::Pass, 'No name or ID collisions detected.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C2, SchedulerDoctorStatus::Pass, 'No name or ID collisions detected.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -210,8 +208,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkCommandAllowlistValid(array $schedules): SchedulerDoctorFinding
     {
         if ($this->validator === null) {
-            return new SchedulerDoctorFinding(
-                'C3',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C3,
                 SchedulerDoctorStatus::Skip,
                 'No CommandSpecValidator registered — allowlist check skipped.',
             );
@@ -231,8 +228,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($violations !== []) {
-            return new SchedulerDoctorFinding(
-                'C3',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C3,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d schedule(s) reference non-allowlisted command classes.', count($violations)),
                 implode("\n", $violations),
@@ -240,7 +236,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C3', SchedulerDoctorStatus::Pass, 'All command classes are allowlisted.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C3, SchedulerDoctorStatus::Pass, 'All command classes are allowlisted.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -257,8 +253,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $lease = $this->leasePort->acquire($key, $token, 5);
 
             if ($lease === null) {
-                return new SchedulerDoctorFinding(
-                    'C4',
+                return new SchedulerDoctorFinding(SchedulerDoctorCheck::C4,
                     SchedulerDoctorStatus::Fail,
                     'Lease driver returned null for probe acquire — driver may be unavailable.',
                     'acquire() returned null for probe key: ' . $key,
@@ -266,10 +261,9 @@ final class SchedulerDoctor implements SchedulerDoctorPort
                 );
             }
 
-            return new SchedulerDoctorFinding('C4', SchedulerDoctorStatus::Pass, 'Lease driver is reachable.');
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C4, SchedulerDoctorStatus::Pass, 'Lease driver is reachable.');
         } catch (\Throwable $e) {
-            return new SchedulerDoctorFinding(
-                'C4',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C4,
                 SchedulerDoctorStatus::Fail,
                 'Lease driver threw an exception during probe acquire.',
                 $e->getMessage(),
@@ -313,8 +307,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($missing !== []) {
-            return new SchedulerDoctorFinding(
-                'C5',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C5,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d required table(s) are missing.', count($missing)),
                 'Missing tables: ' . implode(', ', $missing),
@@ -322,7 +315,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C5', SchedulerDoctorStatus::Pass, 'All required tables are present.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C5, SchedulerDoctorStatus::Pass, 'All required tables are present.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -333,8 +326,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkSensitiveApprovalsPresent(array $schedules): SchedulerDoctorFinding
     {
         if ($this->approvalStore === null) {
-            return new SchedulerDoctorFinding(
-                'C6',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C6,
                 SchedulerDoctorStatus::Skip,
                 'No FourEyesApprovalStore registered — approval check skipped.',
             );
@@ -368,8 +360,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($missing !== []) {
-            return new SchedulerDoctorFinding(
-                'C6',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C6,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d sensitive schedule(s) lack a recorded activation approval.', count($missing)),
                 implode("\n", $missing),
@@ -377,7 +368,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C6', SchedulerDoctorStatus::Pass, 'All sensitive schedules have approval records.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C6, SchedulerDoctorStatus::Pass, 'All sensitive schedules have approval records.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -405,8 +396,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($violations !== []) {
-            return new SchedulerDoctorFinding(
-                'C7',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C7,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d sensitive schedule(s) lack explicit misfire policy declaration.', count($violations)),
                 implode("\n", $violations),
@@ -414,7 +404,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C7', SchedulerDoctorStatus::Pass, 'All sensitive schedules have explicit misfire policy.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C7, SchedulerDoctorStatus::Pass, 'All sensitive schedules have explicit misfire policy.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -425,8 +415,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkCatchupBoundsValid(array $schedules): SchedulerDoctorFinding
     {
         if ($this->maxCatchupAgeSec <= 0) {
-            return new SchedulerDoctorFinding(
-                'C8',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C8,
                 SchedulerDoctorStatus::Fail,
                 'maxCatchupAgeSec must be > 0.',
                 sprintf('Configured maxCatchupAgeSec = %d', $this->maxCatchupAgeSec),
@@ -453,8 +442,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($violations !== []) {
-            return new SchedulerDoctorFinding(
-                'C8',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C8,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d schedule(s) have invalid FireEachMissed caps.', count($violations)),
                 implode("\n", $violations),
@@ -462,7 +450,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding('C8', SchedulerDoctorStatus::Pass, 'Catchup bounds are valid.');
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C8, SchedulerDoctorStatus::Pass, 'Catchup bounds are valid.');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -472,8 +460,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkShardConfigValid(): SchedulerDoctorFinding
     {
         if ($this->shardCount < 1) {
-            return new SchedulerDoctorFinding(
-                'C9',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C9,
                 SchedulerDoctorStatus::Fail,
                 sprintf('shardCount must be >= 1, got %d.', $this->shardCount),
                 '',
@@ -508,8 +495,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($failures !== []) {
-            return new SchedulerDoctorFinding(
-                'C9',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C9,
                 SchedulerDoctorStatus::Fail,
                 sprintf('%d shard probe(s) failed.', count($failures)),
                 implode("\n", $failures),
@@ -517,8 +503,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding(
-            'C9',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C9,
             SchedulerDoctorStatus::Pass,
             sprintf('Shard config valid; all %d shard probe(s) succeeded.', $this->shardCount),
         );
@@ -535,8 +520,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkRetentionStatusValid(DateTimeImmutable $now): SchedulerDoctorFinding
     {
         if ($this->runRetentionDays <= 0) {
-            return new SchedulerDoctorFinding(
-                'C10',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C10,
                 SchedulerDoctorStatus::Pass,
                 'Auto-prune disabled (SCHEDULER_RUN_RETENTION_DAYS=0).',
             );
@@ -561,8 +545,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         );
 
         if ($attemptCount === 0) {
-            return new SchedulerDoctorFinding(
-                'C10',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C10,
                 SchedulerDoctorStatus::Skip,
                 'Auto-prune is configured but has not fired yet — expected before the next scheduled run.',
                 sprintf('Global retention = %d days, %d tenant override(s).', $this->runRetentionDays, count($overrides)),
@@ -580,8 +563,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
 
         if ($lastCompletedAt === null
             || $lastCompletedAt->modify(sprintf('+%d hours', self::PRUNE_LIVENESS_STALE_HOURS)) < $now) {
-            return new SchedulerDoctorFinding(
-                'C10',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C10,
                 SchedulerDoctorStatus::Fail,
                 $lastCompletedAt === null
                     ? 'Auto-prune has attempted to fire but has never completed successfully.'
@@ -596,8 +578,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         }
 
-        return new SchedulerDoctorFinding(
-            'C10',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C10,
             SchedulerDoctorStatus::Pass,
             sprintf(
                 'Auto-prune active, global retention = %d days, %d tenant override(s); last completed %s.',
@@ -620,8 +601,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkFireQueueConsumerHealthy(DateTimeImmutable $now): SchedulerDoctorFinding
     {
         if ($this->commandBus === null) {
-            return new SchedulerDoctorFinding(
-                'C11',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C11,
                 SchedulerDoctorStatus::Skip,
                 'CQRS CommandBus not wired — fire-queue consumer cannot dispatch; check skipped.',
             );
@@ -634,15 +614,14 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         );
 
         if ($oldestPendingRaw === false || $oldestPendingRaw === null) {
-            return new SchedulerDoctorFinding('C11', SchedulerDoctorStatus::Pass, 'Fire queue is empty — draining normally.');
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C11, SchedulerDoctorStatus::Pass, 'Fire queue is empty — draining normally.');
         }
 
         $oldestAt = new DateTimeImmutable((string) $oldestPendingRaw);
         $ageSec   = $now->getTimestamp() - $oldestAt->getTimestamp();
 
         if ($ageSec <= $this->consumeStallThresholdSec) {
-            return new SchedulerDoctorFinding(
-                'C11',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C11,
                 SchedulerDoctorStatus::Pass,
                 sprintf('Fire queue draining normally (oldest pending row: %ds old).', $ageSec),
             );
@@ -652,8 +631,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             "SELECT COUNT(*) FROM {$queueTable} WHERE status = 'pending'",
         );
 
-        return new SchedulerDoctorFinding(
-            'C11',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C11,
             SchedulerDoctorStatus::Fail,
             sprintf('%d row(s) pending in the fire queue; oldest is %ds old.', $pendingCount, $ageSec),
             '',
@@ -680,23 +658,21 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             );
         } catch (\Throwable) {
             // Older schema without the requeue columns/status — nothing to assert.
-            return new SchedulerDoctorFinding(
-                'C12',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C12,
                 SchedulerDoctorStatus::Skip,
                 'Fire-queue requeue columns not present — dead-letter check skipped.',
             );
         }
 
         if ($deadLetters === 0) {
-            return new SchedulerDoctorFinding('C12', SchedulerDoctorStatus::Pass, 'No dead-lettered fires.');
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C12, SchedulerDoctorStatus::Pass, 'No dead-lettered fires.');
         }
 
         $sampleClass = (string) ($this->connection->fetchOne(
             "SELECT command_class FROM {$queueTable} WHERE status = 'dead_letter' ORDER BY dispatched_at DESC LIMIT 1",
         ) ?: 'unknown');
 
-        return new SchedulerDoctorFinding(
-            'C12',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C12,
             SchedulerDoctorStatus::Fail,
             sprintf('%d fire(s) dead-lettered — no capable consumer ran them.', $deadLetters),
             sprintf('most recent dead-letter command_class: %s', $sampleClass),
@@ -720,8 +696,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkFireQueueStranded(DateTimeImmutable $now): SchedulerDoctorFinding
     {
         if ($this->commandBus === null) {
-            return new SchedulerDoctorFinding(
-                'C15',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C15,
                 SchedulerDoctorStatus::Skip,
                 'CQRS CommandBus not wired — no consumer can claim fires; check skipped.',
             );
@@ -738,8 +713,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
                 [$cutoff],
             );
         } catch (\Throwable) {
-            return new SchedulerDoctorFinding(
-                'C15',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C15,
                 SchedulerDoctorStatus::Skip,
                 'Fire-queue claimed_at column not present — stranded-fire check skipped (run the scheduler migrations).',
             );
@@ -748,22 +722,20 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         $stranded = (int) ($row['stranded'] ?? 0);
 
         if ($stranded === 0) {
-            return new SchedulerDoctorFinding('C15', SchedulerDoctorStatus::Pass, 'No fires abandoned mid-dispatch.');
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C15, SchedulerDoctorStatus::Pass, 'No fires abandoned mid-dispatch.');
         }
 
-        // Runtime state, so it must not gate a deploy (gatesDeploy: false), for the reason C14 does not:
+        // Runtime state (SchedulerDoctorCheck::C15 is Advisory), for the reason C14 is:
         // the consumer that reclaims stranded fires ships WITH the release. The first release carrying
         // this check was refused by it — 52 fires stranded by the old consumer, reclaimable only by the
         // new one the gate would not install. Loud here and in the deploy log; never a veto.
-        return new SchedulerDoctorFinding(
-            'C15',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C15,
             SchedulerDoctorStatus::Fail,
             sprintf('%d fire(s) stuck in processing past the %ds claim lease.', $stranded, $this->fireLeaseSec),
             sprintf('oldest claimed at %s', (string) ($row['oldest'] ?? 'unknown')),
             'A fire-queue consumer exited mid-dispatch (memory_limit fatal, OOM kill, or SIGKILL) and nothing '
             . 'has reclaimed the rows. Check that scheduler:consume --loop is running on a release with the '
             . 'claim lease, and read its logs for the fatal.',
-            gatesDeploy: false,
         );
     }
 
@@ -784,15 +756,13 @@ final class SchedulerDoctor implements SchedulerDoctorPort
     private function checkDeadManDetectorWired(): SchedulerDoctorFinding
     {
         if ($this->deadManDetector !== null) {
-            return new SchedulerDoctorFinding(
-                'C13',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C13,
                 SchedulerDoctorStatus::Pass,
                 'Dead-man detector is wired — overdue schedules will raise alerts.',
             );
         }
 
-        return new SchedulerDoctorFinding(
-            'C13',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C13,
             SchedulerDoctorStatus::Fail,
             'No dead-man detector is wired — a schedule that stops firing will NOT alert anyone.',
             '',
@@ -827,7 +797,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         ));
 
         if ($active === []) {
-            return new SchedulerDoctorFinding('C14', SchedulerDoctorStatus::Pass, 'No active schedules to check.');
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C14, SchedulerDoctorStatus::Pass, 'No active schedules to check.');
         }
 
         $cursorsTable = $this->tablePrefix . 'scheduler_cursors';
@@ -845,8 +815,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
                 "SELECT schedule_id, first_seen_at FROM {$cursorsTable}",
             );
         } catch (\Throwable) {
-            return new SchedulerDoctorFinding(
-                'C14',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C14,
                 SchedulerDoctorStatus::Skip,
                 'Run ledger unavailable — overdue check skipped.',
             );
@@ -912,15 +881,13 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         }
 
         if ($overdue === []) {
-            return new SchedulerDoctorFinding(
-                'C14',
+            return new SchedulerDoctorFinding(SchedulerDoctorCheck::C14,
                 SchedulerDoctorStatus::Pass,
                 sprintf('All %d active schedule(s) dispatched within tolerance.', count($active)),
             );
         }
 
-        return new SchedulerDoctorFinding(
-            'C14',
+        return new SchedulerDoctorFinding(SchedulerDoctorCheck::C14,
             SchedulerDoctorStatus::Fail,
             sprintf('%d of %d active schedule(s) are overdue.', count($overdue), count($active)),
             implode('; ', $overdue),
@@ -929,8 +896,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             . 'scheduler image knows only the schedules that existed when it was built), and that '
             . 'the fire-queue consumer is draining (C11).',
             // Runtime state, not deployability: overdue schedules are very often fixed BY the
-            // deployment being gated. See SchedulerDoctorFinding::$gatesDeploy.
-            gatesDeploy: false,
+            // deployment being gated — which is why SchedulerDoctorCheck::C14 is Advisory.
         );
     }
 

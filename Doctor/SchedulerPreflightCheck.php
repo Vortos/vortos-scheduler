@@ -8,15 +8,16 @@ use Vortos\Deploy\Preflight\PreflightCategory;
 use Vortos\Deploy\Preflight\PreflightCheckInterface;
 use Vortos\Deploy\Preflight\PreflightContext;
 use Vortos\Deploy\Preflight\PreflightFinding;
+use Vortos\OpsKit\Gate\GateDisposition;
 
 /**
- * Wires `scheduler:doctor` (9 checks, fail-closed) into the `deploy:doctor` gate.
+ * Bridges `scheduler:doctor` into `deploy:doctor`.
  *
- * Only registered when `vortos-deploy` is installed — the {@see SchedulerExtension}
- * guards registration with `interface_exists(PreflightCheckInterface::class)`.
- *
- * This check is read-only (C4 and C9 do acquire+release a tiny probe lease; C5 does
- * SELECT 1 FROM table). It never mutates schedule data or audit records.
+ * The scheduler doctor mixes configuration checks with live runtime-state checks, and each declares
+ * its own disposition ({@see SchedulerDoctorCheck::disposition()}). This bridge is one preflight
+ * finding, so it reports the strictest thing it saw: a blocking scheduler failure is a blocking
+ * finding; advisory-only failures are a failure narrowed to Advisory — shown as a warning on every
+ * deploy, and blocking under `--strict`, but never a veto on the release that may be their cure.
  */
 final class SchedulerPreflightCheck implements PreflightCheckInterface
 {
@@ -30,6 +31,11 @@ final class SchedulerPreflightCheck implements PreflightCheckInterface
     public function category(): PreflightCategory
     {
         return PreflightCategory::Capability;
+    }
+
+    public function disposition(): GateDisposition
+    {
+        return GateDisposition::Blocking;
     }
 
     public function check(PreflightContext $context): PreflightFinding
@@ -46,49 +52,37 @@ final class SchedulerPreflightCheck implements PreflightCheckInterface
             );
         }
 
-        // Only DEPLOY-BLOCKING failures gate. Runtime-state checks (C14, overdue schedules) stay
-        // visible in `scheduler:doctor` and in alerting, but must not veto a release — a stalled
-        // schedule is usually fixed BY deploying, so gating on it deadlocks the fix behind the
-        // symptom. That is not hypothetical: the release that fixed the interval-trigger bug was
-        // refused by the check reporting the 11 schedules that bug had stalled.
-        $blocking = array_filter(
+        $describe = static fn (SchedulerDoctorFinding $f): string => "[{$f->checkId}] {$f->summary}";
+
+        $blocking = array_values(array_filter(
             $report->findings,
-            fn (SchedulerDoctorFinding $f) => $f->isDeployBlockingFailure(),
-        );
+            static fn (SchedulerDoctorFinding $f): bool => $f->isDeployBlockingFailure(),
+        ));
 
         if ($blocking !== []) {
-            $failMessages = array_map(
-                fn (SchedulerDoctorFinding $f) => "[{$f->checkId}] {$f->summary}",
-                $blocking,
-            );
-
             return PreflightFinding::fail(
                 $this->id(),
                 $this->category(),
-                sprintf('%d scheduler doctor check(s) failed.', count($failMessages)),
-                detail: implode('; ', $failMessages),
+                sprintf('%d scheduler doctor check(s) failed.', count($blocking)),
+                detail: implode('; ', array_map($describe, $blocking)),
                 remediation: 'Run `php bin/console scheduler:doctor` for per-check details and fix instructions.',
             );
         }
 
-        // Non-gating failures are still surfaced, so a passing gate never hides them from the
-        // deploy log — the operator sees them, the pipeline just does not stop for them.
-        $advisory = array_map(
-            fn (SchedulerDoctorFinding $f) => "[{$f->checkId}] {$f->summary}",
-            array_filter($report->findings, fn (SchedulerDoctorFinding $f) => $f->isFailure()),
-        );
+        $advisory = array_values(array_filter(
+            $report->findings,
+            static fn (SchedulerDoctorFinding $f): bool => $f->isAdvisoryFailure(),
+        ));
 
         if ($advisory !== []) {
-            return PreflightFinding::pass(
+            return PreflightFinding::fail(
                 $this->id(),
                 $this->category(),
-                sprintf(
-                    '%d scheduler doctor check(s) passed the deploy gate; %d runtime-state warning(s).',
-                    count($report->findings) - count($advisory),
-                    count($advisory),
-                ),
-                detail: 'Not blocking, but investigate: ' . implode('; ', $advisory),
-            );
+                sprintf('%d runtime-state warning(s) from scheduler:doctor.', count($advisory)),
+                detail: implode('; ', array_map($describe, $advisory)),
+                remediation: 'These describe the running scheduler, not this release. Investigate with '
+                    . '`php bin/console scheduler:doctor`; the matching alerts fire independently of deploys.',
+            )->withDisposition(GateDisposition::Advisory);
         }
 
         return PreflightFinding::pass(

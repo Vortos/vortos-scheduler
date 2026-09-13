@@ -40,6 +40,7 @@ final readonly class SchedulerDoctorReport
                 'clear'          => $this->isClear(),
                 'findings'       => array_map(fn($f) => [
                     'check_id'    => $f->checkId,
+                    'disposition' => $f->disposition()->value,
                     'status'      => $f->status->value,
                     'summary'     => $f->summary,
                     'detail'      => $f->detail,

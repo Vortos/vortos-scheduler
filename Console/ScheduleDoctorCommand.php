@@ -42,7 +42,7 @@ final class ScheduleDoctorCommand extends Command
         }
 
         $table = new Table($output);
-        $table->setHeaders(['Check', 'Status', 'Summary', 'Detail']);
+        $table->setHeaders(['Check', 'Status', 'Gate', 'Summary', 'Detail']);
 
         foreach ($report->findings as $finding) {
             $statusLabel = match ($finding->status) {
@@ -54,6 +54,7 @@ final class ScheduleDoctorCommand extends Command
             $table->addRow([
                 $finding->checkId,
                 $statusLabel,
+                $finding->disposition()->value,
                 $finding->summary,
                 $finding->detail !== '' ? substr($finding->detail, 0, 100) : '',
             ]);
