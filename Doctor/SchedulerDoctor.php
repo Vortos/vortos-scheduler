@@ -30,11 +30,13 @@ use Vortos\Scheduler\Store\ScheduleStoreInterface;
 /**
  * Fail-closed preflight health inspector for the scheduler subsystem.
  *
- * Runs 11 checks (C1–C11) that cover cron validity, name collisions,
+ * Runs 15 checks (C1–C15) that cover cron validity, name collisions,
  * command allowlisting, lease driver reachability, migration state,
  * 4-eyes approval coverage, misfire policy safety, catchup bounds,
- * shard lease probe, auto-prune config + liveness (C10), and fire-queue
- * consumer liveness (C11, S12).
+ * shard lease probe, auto-prune config + liveness (C10), fire-queue
+ * consumer liveness (C11, S12), dead-lettered fires (C12), the overdue
+ * alarm's wiring (C13), overdue schedules (C14), and fires abandoned
+ * mid-dispatch by a consumer that died (C15, FB-64).
  */
 final class SchedulerDoctor implements SchedulerDoctorPort
 {
@@ -73,6 +75,9 @@ final class SchedulerDoctor implements SchedulerDoctorPort
         // leaving it to be inferred from an absence of alerts. Typed ?object to avoid coupling
         // the doctor to a class that may legitimately be absent.
         private readonly ?object                          $deadManDetector = null,
+        // FB-64: the consumer's claim lease. A fire still `processing` past it was abandoned by a
+        // consumer that died mid-dispatch. Must match scheduler.fire_lease_sec.
+        private readonly int                               $fireLeaseSec = 900,
     ) {}
 
     public function run(): SchedulerDoctorReport
@@ -97,6 +102,7 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             $this->checkRetentionStatusValid($now),
             $this->checkFireQueueConsumerHealthy($now),
             $this->checkFireQueueDeadLetters(),
+            $this->checkFireQueueStranded($now),
             $this->checkDeadManDetectorWired(),
             $this->checkNoScheduleIsOverdue($allSchedules, $now),
         ];
@@ -697,6 +703,62 @@ final class SchedulerDoctor implements SchedulerDoctorPort
             'A scheduled command class is not present on any running consumer node. Deploy the command '
             . 'to a consumer (or add it to #[SchedulableCommand]) and re-enqueue, then investigate the '
             . 'capability gap (commonly a stale blue/green image).',
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // C15 — Fires abandoned mid-dispatch (FB-64)
+    //
+    // A consumer that dies between claiming a fire and finishing it — a memory_limit fatal, an OOM
+    // kill, a SIGKILL past the supervisor's stop timeout — leaves the row `processing`. The consumer
+    // reclaims such rows on its next batch once the lease lapses, so a row that stays past the lease
+    // means either no consumer is running or it is on a release without the reclaim. Either way
+    // scheduled work is being lost, and before this check it was lost silently: C11 only looks at
+    // `pending`, and the prune never collects a non-terminal row.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function checkFireQueueStranded(DateTimeImmutable $now): SchedulerDoctorFinding
+    {
+        if ($this->commandBus === null) {
+            return new SchedulerDoctorFinding(
+                'C15',
+                SchedulerDoctorStatus::Skip,
+                'CQRS CommandBus not wired — no consumer can claim fires; check skipped.',
+            );
+        }
+
+        $queueTable = $this->tablePrefix . 'scheduler_fire_queue';
+        $cutoff     = $now->modify(sprintf('-%d seconds', max(1, $this->fireLeaseSec)))->format('Y-m-d H:i:s');
+
+        try {
+            $row = $this->connection->fetchAssociative(
+                "SELECT COUNT(*) AS stranded, MIN(COALESCE(claimed_at, created_at)) AS oldest
+                   FROM {$queueTable}
+                  WHERE status = 'processing' AND COALESCE(claimed_at, created_at) <= ?",
+                [$cutoff],
+            );
+        } catch (\Throwable) {
+            return new SchedulerDoctorFinding(
+                'C15',
+                SchedulerDoctorStatus::Skip,
+                'Fire-queue claimed_at column not present — stranded-fire check skipped (run the scheduler migrations).',
+            );
+        }
+
+        $stranded = (int) ($row['stranded'] ?? 0);
+
+        if ($stranded === 0) {
+            return new SchedulerDoctorFinding('C15', SchedulerDoctorStatus::Pass, 'No fires abandoned mid-dispatch.');
+        }
+
+        return new SchedulerDoctorFinding(
+            'C15',
+            SchedulerDoctorStatus::Fail,
+            sprintf('%d fire(s) stuck in processing past the %ds claim lease.', $stranded, $this->fireLeaseSec),
+            sprintf('oldest claimed at %s', (string) ($row['oldest'] ?? 'unknown')),
+            'A fire-queue consumer exited mid-dispatch (memory_limit fatal, OOM kill, or SIGKILL) and nothing '
+            . 'has reclaimed the rows. Check that scheduler:consume --loop is running on a release with the '
+            . 'claim lease, and read its logs for the fatal.',
         );
     }
 

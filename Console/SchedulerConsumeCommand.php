@@ -10,6 +10,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
+use Vortos\Scheduler\Engine\Consumer\WorkerRecyclePolicy;
 
 /**
  * Entrypoint for the fire-queue consumer (S12) — drains vortos_scheduler_fire_queue,
@@ -21,6 +22,10 @@ use Vortos\Scheduler\Engine\Consumer\FireQueueConsumer;
  *
  * Usage (managed by supervisord via WorkerProcessDefinition, alongside scheduler:run):
  *   php /var/www/html/bin/console scheduler:consume --loop
+ *
+ * In --loop mode the process recycles itself — exits cleanly for supervisord to restart — before it
+ * can reach memory_limit, and after --time-limit seconds. A worker that hits memory_limit instead
+ * dies on a fatal mid-batch and strands the rows it claimed (FB-64).
  */
 #[AsCommand(
     name: 'scheduler:consume',
@@ -34,6 +39,8 @@ final class SchedulerConsumeCommand extends Command
         private readonly FireQueueConsumer $consumer,
         private readonly int $defaultBatchSize = 50,
         private readonly int $defaultPollIntervalSec = 2,
+        private readonly int $defaultMemoryLimitMib = 0,
+        private readonly int $defaultTimeLimitSec = 3600,
     ) {
         parent::__construct();
     }
@@ -43,7 +50,9 @@ final class SchedulerConsumeCommand extends Command
         $this
             ->addOption('loop', null, InputOption::VALUE_NONE, 'Run continuously until SIGTERM/SIGINT (production mode)')
             ->addOption('batch-size', null, InputOption::VALUE_REQUIRED, 'Rows claimed per batch', (string) $this->defaultBatchSize)
-            ->addOption('poll-interval', null, InputOption::VALUE_REQUIRED, 'Seconds to sleep after an empty batch in --loop mode', (string) $this->defaultPollIntervalSec);
+            ->addOption('poll-interval', null, InputOption::VALUE_REQUIRED, 'Seconds to sleep after an empty batch in --loop mode', (string) $this->defaultPollIntervalSec)
+            ->addOption('memory-limit', null, InputOption::VALUE_REQUIRED, 'In --loop mode, exit cleanly for the supervisor to restart once real memory reaches this many MiB. 0 = 80% of memory_limit, -1 = never', (string) $this->defaultMemoryLimitMib)
+            ->addOption('time-limit', null, InputOption::VALUE_REQUIRED, 'In --loop mode, exit cleanly for the supervisor to restart after this many seconds. 0 = never', (string) $this->defaultTimeLimitSec);
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -69,9 +78,26 @@ final class SchedulerConsumeCommand extends Command
             return Command::SUCCESS;
         }
 
+        $recycle = WorkerRecyclePolicy::fromOptions(
+            (int) $input->getOption('memory-limit'),
+            (int) $input->getOption('time-limit'),
+            (string) \ini_get('memory_limit'),
+            microtime(true),
+        );
+
         $output->writeln('<info>Scheduler consumer starting (--loop).</info>');
 
         while (!$this->stopping) {
+            // Checked before claiming, never after: a worker about to recycle must not take rows it
+            // will not finish.
+            $reason = $recycle->reasonToStop(\memory_get_usage(true), microtime(true));
+
+            if ($reason !== null) {
+                $output->writeln(sprintf('<comment>Scheduler consumer recycling: %s.</comment>', $reason));
+
+                break;
+            }
+
             $processed = $this->consumer->consumeBatch($batchSize);
 
             if ($processed === 0) {

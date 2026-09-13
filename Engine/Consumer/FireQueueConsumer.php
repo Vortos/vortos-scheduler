@@ -43,6 +43,13 @@ use Vortos\Scheduler\Store\ScheduleRunStoreInterface;
  *     dead-lettered after `maxAttempts`. A genuine command failure (class present and capable, but
  *     the handler/payload throws) stays terminal `failed` as before: retrying a poison pill is
  *     pointless because a capable consumer would fail identically.
+ *
+ * ## FB-64 — claim lease
+ *
+ * A claim commits `processing` and dispatches outside that transaction, so a consumer that dies in
+ * between (a PHP fatal on memory_limit, a SIGKILL past the supervisor's stop timeout, an OOM kill)
+ * used to strand its rows in `processing` for ever. Every claim now stamps `claimed_at`, and each
+ * batch first reclaims rows whose lease has lapsed — see recoverStranded().
  */
 final class FireQueueConsumer
 {
@@ -69,6 +76,17 @@ final class FireQueueConsumer
          * container can construct this without one; wired in production.
          */
         private readonly ?ServicesResetter          $servicesResetter = null,
+        /**
+         * How long a claimed row may stay `processing` before it is presumed abandoned. Must comfortably
+         * exceed the longest scheduled command: a command still running past it is reclaimed underneath
+         * itself. Long work does not belong on the fire queue.
+         */
+        private readonly int                        $leaseSeconds = 900,
+        /**
+         * An abandoned row older than this is failed rather than re-run. A sweep missed yesterday should
+         * surface as a failure, not quietly execute a day late.
+         */
+        private readonly int                        $strandedMaxAgeSeconds = 86400,
     ) {}
 
     /**
@@ -86,6 +104,9 @@ final class FireQueueConsumer
                 . 'container before running scheduler:consume.',
             );
         }
+
+        // Resolve what an earlier consumer claimed and never finished before taking anything new.
+        $this->recoverStranded();
 
         $capabilities = $this->capabilityResolver?->capableCommandClasses();
 
@@ -176,8 +197,8 @@ final class FireQueueConsumer
             if ($ids !== []) {
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $this->connection->executeStatement(
-                    "UPDATE {$this->table} SET status = 'processing' WHERE id IN ({$placeholders})",
-                    $ids,
+                    "UPDATE {$this->table} SET status = 'processing', claimed_at = ? WHERE id IN ({$placeholders})",
+                    [$this->clock->now()->format('Y-m-d H:i:s'), ...$ids],
                 );
             }
 
@@ -214,8 +235,8 @@ final class FireQueueConsumer
 
         $placeholders = implode(',', array_fill(0, count($ids), '?'));
         $this->connection->executeStatement(
-            "UPDATE {$this->table} SET status = 'processing' WHERE id IN ({$placeholders})",
-            $ids,
+            "UPDATE {$this->table} SET status = 'processing', claimed_at = ? WHERE id IN ({$placeholders})",
+            [$this->clock->now()->format('Y-m-d H:i:s'), ...$ids],
         );
 
         return $ids;
@@ -305,7 +326,7 @@ final class FireQueueConsumer
     }
 
     /**
-     * Requeue an unrunnable fire with backoff, or dead-letter it once attempts are exhausted. The
+     * Requeue an unrunnable or stranded fire with backoff, or dead-letter it once attempts are exhausted. The
      * run-ledger row is NOT transitioned to Failed on a requeue — a capable consumer will complete
      * it; only a dead-letter is terminal.
      */
@@ -322,7 +343,7 @@ final class FireQueueConsumer
         $nextAttempts = $attempts + 1;
 
         if ($nextAttempts >= $this->maxAttempts) {
-            $this->logger->error('Scheduler fire dead-lettered: no capable consumer', [
+            $this->logger->error('Scheduler fire dead-lettered', [
                 'run_id'        => $runId,
                 'schedule_id'   => $scheduleId,
                 'command_class' => $commandClass,
@@ -355,7 +376,7 @@ final class FireQueueConsumer
 
         $availableAt = $now->modify(sprintf('+%d seconds', $this->backoffSeconds($nextAttempts)));
 
-        $this->logger->warning('Scheduler fire requeued for a capable consumer', [
+        $this->logger->warning('Scheduler fire requeued', [
             'run_id'        => $runId,
             'schedule_id'   => $scheduleId,
             'command_class' => $commandClass,
@@ -366,7 +387,7 @@ final class FireQueueConsumer
 
         $this->connection->executeStatement(
             "UPDATE {$this->table}
-             SET status = 'pending', attempts = ?, available_at = ?, last_error = ?, dispatched_at = NULL
+             SET status = 'pending', attempts = ?, available_at = ?, last_error = ?, dispatched_at = NULL, claimed_at = NULL
              WHERE id = ?",
             [
                 $nextAttempts,
@@ -377,6 +398,121 @@ final class FireQueueConsumer
         );
 
         $this->metrics?->recordFireRequeued($reason, $scheduleId, $tenantId);
+    }
+
+    /**
+     * Resolve fires that a consumer claimed and never finished.
+     *
+     * Before this existed such rows sat in `processing` for ever: their run-ledger rows stayed
+     * `dispatched`, the retention prune skipped them as non-terminal, and nothing alerted. In
+     * production a daily sweep died this way six nights running on a memory_limit fatal, taking the
+     * unrelated fires claimed in the same batch down with it each time.
+     *
+     * A `processing` row whose claim is older than the lease is presumed abandoned and is
+     *  - requeued with backoff (bounded by maxAttempts, then dead-lettered) while running it late is
+     *    still the right thing to do; or
+     *  - marked `failed`, together with its ledger row, once it is older than strandedMaxAgeSeconds.
+     *
+     * Delivery is therefore at-least-once: a command that finished its work and then lost the process
+     * before its row was marked runs again. Scheduled commands must already be idempotent — every
+     * fire carries an IdempotencyKey. Rows claimed before `claimed_at` existed fall back to
+     * `created_at`.
+     */
+    private function recoverStranded(): void
+    {
+        $now          = $this->clock->now();
+        $lease        = max(1, $this->leaseSeconds);
+        $maxAge       = max($lease, $this->strandedMaxAgeSeconds);
+        $leaseCutoff  = $now->modify("-{$lease} seconds")->format('Y-m-d H:i:s');
+        $expiryCutoff = $now->modify("-{$maxAge} seconds")->format('Y-m-d H:i:s');
+        $predicate    = "status = 'processing' AND COALESCE(claimed_at, created_at) <= ?";
+
+        // Unlocked probe first. Nothing is stranded almost always, and an idle consumer polls every
+        // couple of seconds — that has to cost one indexed read, not a transaction.
+        if ($this->connection->fetchOne("SELECT 1 FROM {$this->table} WHERE {$predicate} LIMIT 1", [$leaseCutoff]) === false) {
+            return;
+        }
+
+        $lock = $this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform ? ' FOR UPDATE SKIP LOCKED' : '';
+
+        $this->connection->beginTransaction();
+
+        try {
+            $rows = $this->connection->fetchAllAssociative(
+                "SELECT id, run_id, schedule_id, tenant_id, command_class, attempts,
+                        COALESCE(claimed_at, created_at) AS claimed_at_effective
+                   FROM {$this->table}
+                  WHERE {$predicate}
+                  ORDER BY created_at ASC
+                  LIMIT 100{$lock}",
+                [$leaseCutoff],
+            );
+
+            foreach ($rows as $row) {
+                $rowId        = (string) $row['id'];
+                $runId        = (string) $row['run_id'];
+                $scheduleId   = (string) $row['schedule_id'];
+                $tenantId     = isset($row['tenant_id']) && $row['tenant_id'] !== '' ? (string) $row['tenant_id'] : null;
+                $commandClass = (string) $row['command_class'];
+                $claimedAt    = substr((string) $row['claimed_at_effective'], 0, 19);
+
+                if ($claimedAt <= $expiryCutoff) {
+                    $this->failExpiredStranded($rowId, $runId, $scheduleId, $tenantId, $commandClass, $claimedAt, $maxAge, $now);
+
+                    continue;
+                }
+
+                $this->requeueOrDeadLetter($rowId, $runId, $scheduleId, $tenantId, $commandClass, (int) $row['attempts'], 'stranded', $now);
+            }
+
+            $this->connection->commit();
+        } catch (\Throwable $e) {
+            $this->connection->rollBack();
+
+            // Recovery is housekeeping. A failure here must never stop the consumer draining new fires.
+            $this->logger->error('Scheduler fire-queue stranded-row recovery failed', ['error' => $e->getMessage()]);
+        }
+    }
+
+    private function failExpiredStranded(
+        string $rowId,
+        string $runId,
+        string $scheduleId,
+        ?string $tenantId,
+        string $commandClass,
+        string $claimedAt,
+        int $maxAge,
+        \DateTimeImmutable $now,
+    ): void {
+        $this->logger->error('Scheduler fire abandoned mid-dispatch and too old to re-run; marked failed', [
+            'run_id'        => $runId,
+            'schedule_id'   => $scheduleId,
+            'command_class' => $commandClass,
+            'claimed_at'    => $claimedAt,
+        ]);
+
+        try {
+            $this->runStore->transitionRunState($runId, RunState::Failed, $now);
+        } catch (\Throwable) {
+            // Already terminal.
+        }
+
+        $this->connection->executeStatement(
+            "UPDATE {$this->table}
+             SET status = 'failed', dispatched_at = ?, failure_reason = ?, last_error = 'stranded_expired'
+             WHERE id = ?",
+            [
+                $now->format('Y-m-d H:i:s'),
+                sprintf(
+                    'stranded: claimed at %s by a consumer that exited before finishing; not re-run because it is older than %ds',
+                    $claimedAt,
+                    $maxAge,
+                ),
+                $rowId,
+            ],
+        );
+
+        $this->metrics?->recordFireDeadLettered('stranded_expired', $scheduleId, $tenantId);
     }
 
     /** Exponential backoff with jitter, capped. */
@@ -395,7 +531,7 @@ final class FireQueueConsumer
         $this->connection->executeStatement(
             "UPDATE {$this->table}
              SET status = ?, dispatched_at = ?, failure_reason = ?
-             WHERE id = ?",
+             WHERE id = ? AND status = 'processing'",
             [$status, $at->format('Y-m-d H:i:s'), $failureReason, $rowId],
         );
     }

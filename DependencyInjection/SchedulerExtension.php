@@ -689,6 +689,8 @@ final class SchedulerExtension extends Extension
             ->setArgument('$maxAttempts', $config['fire_max_attempts'])
             ->setArgument('$backoffBaseSec', $config['fire_backoff_base_sec'])
             ->setArgument('$backoffCapSec', $config['fire_backoff_cap_sec'])
+            ->setArgument('$leaseSeconds', $config['fire_lease_sec'] ?? 900)
+            ->setArgument('$strandedMaxAgeSeconds', $config['fire_stranded_max_age_sec'] ?? 86400)
             // Resets per-request-scoped services between fires, the way Runner does
             // between HTTP requests. Without it a long-lived scheduler:consume worker
             // accumulates the Doctrine identity map and memoised feature flags for its
@@ -701,6 +703,8 @@ final class SchedulerExtension extends Extension
             ->setArgument('$consumer', new Reference(FireQueueConsumer::class))
             ->setArgument('$defaultBatchSize', $config['consume_batch_size'])
             ->setArgument('$defaultPollIntervalSec', $config['consume_poll_interval_sec'])
+            ->setArgument('$defaultMemoryLimitMib', $config['consume_memory_limit_mib'] ?? 0)
+            ->setArgument('$defaultTimeLimitSec', $config['consume_time_limit_sec'] ?? 3600)
             ->addTag('console.command')
             ->setPublic(false);
 
@@ -775,6 +779,7 @@ final class SchedulerExtension extends Extension
             ->setArgument('$maxCatchupAgeSec', $config['max_catchup_age_sec'])
             ->setArgument('$runRetentionDays', $config['run_retention_days'])
             ->setArgument('$retentionOverrideStore', new Reference(RunRetentionOverrideStoreInterface::class, ContainerInterface::NULL_ON_INVALID_REFERENCE))
+            ->setArgument('$fireLeaseSec', $config['fire_lease_sec'] ?? 900)
             // Inject the CommandBus optionally: null (unwired) ⇒ C11 skips because the consumer
             // cannot dispatch. The container resolves this at compile time, so it correctly
             // reflects whether the bus is actually wired in THIS container.

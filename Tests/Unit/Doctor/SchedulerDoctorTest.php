@@ -92,6 +92,7 @@ final class SchedulerDoctorTest extends TestCase
         ?object $commandBus = null,
         int $consumeStallThresholdSec = 120,
         ?object $deadManDetector = null,
+        int $fireLeaseSec = 900,
     ): SchedulerDoctor {
         $reg      = $registry ?? new StaticScheduleRegistry([]);
         $overrides = new InMemoryScheduleStatusOverrideStore();
@@ -114,6 +115,7 @@ final class SchedulerDoctorTest extends TestCase
             commandBus:                 $commandBus,
             consumeStallThresholdSec:   $consumeStallThresholdSec,
             deadManDetector:            $deadManDetector,
+            fireLeaseSec:               $fireLeaseSec,
         );
     }
 
@@ -327,7 +329,8 @@ final class SchedulerDoctorTest extends TestCase
                 available_at DATETIME NULL,
                 last_error TEXT NULL,
                 dispatched_at DATETIME NULL,
-                created_at DATETIME NOT NULL
+                created_at DATETIME NOT NULL,
+                claimed_at DATETIME NULL
             )
         ');
     }
@@ -659,7 +662,7 @@ final class SchedulerDoctorTest extends TestCase
     public function test_report_has_exactly_fourteen_findings(): void
     {
         $report = $this->makeDoctor()->run();
-        self::assertCount(14, $report->findings);
+        self::assertCount(15, $report->findings);
     }
 
     public function test_report_finding_ids_are_c1_through_c14(): void
@@ -850,6 +853,84 @@ final class SchedulerDoctorTest extends TestCase
         $c12 = $this->findCheck($report->findings, 'C12');
         self::assertSame(SchedulerDoctorStatus::Fail, $c12->status);
         self::assertStringContainsString('RunDatabaseBackup', $c12->detail);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // C15 — Fires abandoned mid-dispatch (FB-64)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function test_c15_passes_when_nothing_is_processing(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+
+        $c15 = $this->findCheck($this->makeDoctor(conn: $conn, commandBus: new \stdClass())->run()->findings, 'C15');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c15->status);
+    }
+
+    public function test_c15_passes_when_a_claim_is_inside_its_lease(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+        $conn->insert('vortos_scheduler_fire_queue', [
+            'id' => 'row-live', 'status' => 'processing',
+            'created_at' => $this->clock->now()->modify('-10 minutes')->format('Y-m-d H:i:s'),
+            'claimed_at' => $this->clock->now()->modify('-5 minutes')->format('Y-m-d H:i:s'),
+        ]);
+
+        $c15 = $this->findCheck($this->makeDoctor(conn: $conn, commandBus: new \stdClass(), fireLeaseSec: 900)->run()->findings, 'C15');
+
+        self::assertSame(SchedulerDoctorStatus::Pass, $c15->status);
+    }
+
+    public function test_c15_fails_when_a_claim_outlives_its_lease(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+        $conn->insert('vortos_scheduler_fire_queue', [
+            'id' => 'row-stranded', 'status' => 'processing',
+            'created_at' => '2026-07-01 00:32:00',
+            'claimed_at' => '2026-07-01 00:32:42',
+        ]);
+
+        $c15 = $this->findCheck($this->makeDoctor(conn: $conn, commandBus: new \stdClass(), fireLeaseSec: 900)->run()->findings, 'C15');
+
+        self::assertSame(SchedulerDoctorStatus::Fail, $c15->status);
+        self::assertStringContainsString('1 fire(s)', $c15->summary);
+        self::assertStringContainsString('2026-07-01 00:32:42', $c15->detail);
+        self::assertStringContainsString('scheduler:consume', $c15->remediation);
+    }
+
+    public function test_c15_judges_a_legacy_claim_without_claimed_at_by_its_created_at(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $this->makeRunsAndQueueTables($conn);
+        $conn->insert('vortos_scheduler_fire_queue', [
+            'id' => 'row-legacy', 'status' => 'processing',
+            'created_at' => $this->clock->now()->modify('-2 hours')->format('Y-m-d H:i:s'),
+        ]);
+
+        $c15 = $this->findCheck($this->makeDoctor(conn: $conn, commandBus: new \stdClass())->run()->findings, 'C15');
+
+        self::assertSame(SchedulerDoctorStatus::Fail, $c15->status);
+    }
+
+    public function test_c15_skips_on_a_schema_without_claimed_at(): void
+    {
+        $conn = $this->makeSqliteConnection();
+        $conn->executeStatement('CREATE TABLE vortos_scheduler_fire_queue (id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at DATETIME NOT NULL)');
+
+        $c15 = $this->findCheck($this->makeDoctor(conn: $conn, commandBus: new \stdClass())->run()->findings, 'C15');
+
+        self::assertSame(SchedulerDoctorStatus::Skip, $c15->status);
+    }
+
+    public function test_c15_skips_when_no_consumer_can_run(): void
+    {
+        $c15 = $this->findCheck($this->makeDoctor(commandBus: null)->run()->findings, 'C15');
+
+        self::assertSame(SchedulerDoctorStatus::Skip, $c15->status);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

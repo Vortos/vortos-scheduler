@@ -53,7 +53,8 @@ final class FireQueueConsumerTest extends TestCase
                 failure_reason TEXT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 available_at DATETIME NULL,
-                last_error TEXT NULL
+                last_error TEXT NULL,
+                claimed_at DATETIME NULL
             )
         ');
 
@@ -243,6 +244,103 @@ final class FireQueueConsumerTest extends TestCase
         self::assertSame('pending', $this->statusOf('run-known'));
     }
 
+    public function test_claim_stamps_claimed_at(): void
+    {
+        $this->insertRow('run-1', FixtureConsumeCommand::class);
+
+        $this->makeConsumer()->consumeBatch(10);
+
+        self::assertSame('2026-07-01 10:05:00', (string) $this->columnOf('run-1', 'claimed_at'));
+    }
+
+    public function test_processing_row_inside_its_lease_is_left_alone(): void
+    {
+        // Claimed five minutes ago against a fifteen-minute lease: a live consumer may still be running it.
+        $this->insertRow('run-live', FixtureConsumeCommand::class, status: 'processing', claimedAt: '2026-07-01 10:00:00');
+
+        self::assertSame(0, $this->makeConsumer()->consumeBatch(10));
+        self::assertSame('processing', $this->statusOf('run-live'));
+        self::assertSame(0, (int) $this->columnOf('run-live', 'attempts'));
+        self::assertCount(0, $this->commandBus->dispatched);
+    }
+
+    /**
+     * FB-64. A consumer that died between claim and completion — in production a memory_limit fatal
+     * during a daily sweep — used to leave its rows in `processing` for ever.
+     */
+    public function test_row_stranded_past_its_lease_is_requeued_and_then_runs(): void
+    {
+        $this->insertRow('run-stranded', FixtureConsumeCommand::class, status: 'processing', claimedAt: '2026-07-01 09:40:00');
+
+        $this->makeConsumer()->consumeBatch(10);
+
+        self::assertSame('pending', $this->statusOf('run-stranded'));
+        self::assertSame(1, (int) $this->columnOf('run-stranded', 'attempts'));
+        self::assertNull($this->columnOf('run-stranded', 'claimed_at'));
+        self::assertStringStartsWith('stranded', (string) $this->columnOf('run-stranded', 'last_error'));
+        self::assertArrayNotHasKey('run-stranded', $this->runStore->transitions, 'a requeue is not terminal');
+        self::assertCount(0, $this->commandBus->dispatched, 'nothing runs until the backoff has passed');
+
+        $later = $this->makeConsumer(clock: new MutableClock(new DateTimeImmutable('2026-07-01T10:10:00Z')));
+
+        self::assertSame(1, $later->consumeBatch(10));
+        self::assertSame('dispatched', $this->statusOf('run-stranded'));
+        self::assertSame(RunState::Completed, $this->runStore->transitions['run-stranded']);
+        self::assertCount(1, $this->commandBus->dispatched);
+    }
+
+    public function test_legacy_processing_row_without_claimed_at_falls_back_to_created_at(): void
+    {
+        // Claimed before claimed_at existed: only created_at says how old it is.
+        $this->insertRow('run-legacy', FixtureConsumeCommand::class, status: 'processing', createdAt: '2026-07-01 09:00:00');
+
+        $this->makeConsumer()->consumeBatch(10);
+
+        self::assertSame('pending', $this->statusOf('run-legacy'));
+        self::assertSame(1, (int) $this->columnOf('run-legacy', 'attempts'));
+    }
+
+    public function test_stranded_row_older_than_max_age_is_failed_not_rerun(): void
+    {
+        // A daily sweep that died three weeks ago must surface as a failure, not run today.
+        $this->insertRow('run-ancient', FixtureConsumeCommand::class, status: 'processing', claimedAt: '2026-06-10 00:32:42');
+
+        $consumer = $this->makeConsumer();
+        $consumer->consumeBatch(10);
+        $consumer->consumeBatch(10);
+
+        self::assertSame('failed', $this->statusOf('run-ancient'));
+        self::assertSame('stranded_expired', (string) $this->columnOf('run-ancient', 'last_error'));
+        self::assertStringContainsString('2026-06-10 00:32:42', (string) $this->columnOf('run-ancient', 'failure_reason'));
+        self::assertSame(RunState::Failed, $this->runStore->transitions['run-ancient']);
+        self::assertCount(0, $this->commandBus->dispatched);
+    }
+
+    public function test_row_that_keeps_stranding_is_dead_lettered(): void
+    {
+        $this->insertRow('run-poison', FixtureConsumeCommand::class, status: 'processing', claimedAt: '2026-07-01 09:40:00', attempts: 2);
+
+        $this->makeConsumer(maxAttempts: 3)->consumeBatch(10);
+
+        self::assertSame('dead_letter', $this->statusOf('run-poison'));
+        self::assertSame(RunState::Failed, $this->runStore->transitions['run-poison']);
+        self::assertCount(0, $this->commandBus->dispatched);
+    }
+
+    public function test_recovery_never_touches_terminal_rows(): void
+    {
+        $this->insertRow('run-done', FixtureConsumeCommand::class, status: 'dispatched', claimedAt: '2026-06-01 00:00:00');
+        $this->insertRow('run-failed', FixtureConsumeCommand::class, status: 'failed', claimedAt: '2026-06-01 00:00:00');
+        $this->insertRow('run-dead', FixtureConsumeCommand::class, status: 'dead_letter', claimedAt: '2026-06-01 00:00:00');
+
+        $this->makeConsumer()->consumeBatch(10);
+
+        self::assertSame('dispatched', $this->statusOf('run-done'));
+        self::assertSame('failed', $this->statusOf('run-failed'));
+        self::assertSame('dead_letter', $this->statusOf('run-dead'));
+        self::assertSame([], $this->runStore->transitions);
+    }
+
     private function statusOf(string $runId): string
     {
         return (string) $this->connection->fetchOne(
@@ -259,8 +357,15 @@ final class FireQueueConsumerTest extends TestCase
         );
     }
 
-    private function insertRow(string $runId, string $commandClass, ?string $payload = null): void
-    {
+    private function insertRow(
+        string $runId,
+        string $commandClass,
+        ?string $payload = null,
+        string $status = 'pending',
+        ?string $claimedAt = null,
+        int $attempts = 0,
+        string $createdAt = '2026-07-01 10:00:00',
+    ): void {
         $this->connection->insert(self::TABLE, [
             'id'              => 'row-' . $runId,
             'run_id'          => $runId,
@@ -271,8 +376,10 @@ final class FireQueueConsumerTest extends TestCase
             'command_class'   => $commandClass,
             'command_payload' => $payload ?? '[]',
             'metadata'        => json_encode(['X-Scheduler-Run-Id' => $runId], JSON_THROW_ON_ERROR),
-            'status'          => 'pending',
-            'created_at'      => '2026-07-01 10:00:00',
+            'status'          => $status,
+            'created_at'      => $createdAt,
+            'claimed_at'      => $claimedAt,
+            'attempts'        => $attempts,
         ]);
     }
 
@@ -280,19 +387,24 @@ final class FireQueueConsumerTest extends TestCase
         ?ConsumerCapabilityResolverInterface $capabilityResolver = null,
         int $maxAttempts = 10,
         ?ServicesResetter $servicesResetter = null,
+        ?MutableClock $clock = null,
+        int $leaseSeconds = 900,
+        int $strandedMaxAgeSeconds = 86400,
     ): FireQueueConsumer {
         return new FireQueueConsumer(
             connection: $this->connection,
             runStore:   $this->runStore,
             commandBus: $this->commandBus,
             hydrator:   new CommandHydrator(),
-            clock:      new MutableClock(new DateTimeImmutable('2026-07-01T10:05:00Z')),
+            clock:      $clock ?? new MutableClock(new DateTimeImmutable('2026-07-01T10:05:00Z')),
             tracer:     new SchedulerTracer(null),
             logger:     new NullLogger(),
             table:      self::TABLE,
             capabilityResolver: $capabilityResolver,
             maxAttempts: $maxAttempts,
             servicesResetter: $servicesResetter,
+            leaseSeconds: $leaseSeconds,
+            strandedMaxAgeSeconds: $strandedMaxAgeSeconds,
         );
     }
 
